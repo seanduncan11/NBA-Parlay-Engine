@@ -14,7 +14,7 @@ from nba_api.stats.static import players
 # CONFIG
 # =========================
 
-API_KEY = "c86b551f2e51c698515893c141c6c1a6"
+API_KEY = st.secrets["ODDS_API_KEY"]
 SEASON = "2025-26"
 MAX_RECENT_GAMES = 10
 SPORT_KEY = "basketball_nba"
