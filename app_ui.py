@@ -473,81 +473,113 @@ def parse_prop_market(
     target_market_keys: List[str],
 ) -> Tuple[Optional[float], Optional[int], Optional[int], Optional[str], List[str]]:
     bookmakers = event_data.get("bookmakers", [])
-    lines: List[float] = []
-    overs: List[int] = []
-    unders: List[int] = []
+
+    selected_lines: List[float] = []
+    selected_overs: List[int] = []
+    selected_unders: List[int] = []
     books_used: List[str] = []
     matched_market_keys: List[str] = []
 
+    def american_prob(odds: Optional[int]) -> Optional[float]:
+        if odds is None:
+            return None
+        if odds > 0:
+            return 100 / (odds + 100)
+        return abs(odds) / (abs(odds) + 100)
+
+    def closeness_to_even(over_price: Optional[int], under_price: Optional[int]) -> float:
+        target = 0.5
+        over_prob = american_prob(over_price)
+        under_prob = american_prob(under_price)
+
+        if over_prob is None or under_prob is None:
+            return 999.0
+
+        return abs(over_prob - target) + abs(under_prob - target)
+
     for bookmaker in bookmakers:
         book_key = bookmaker.get("key", "")
+        best_candidate = None
+
         for market in bookmaker.get("markets", []):
             market_key = market.get("key")
             if market_key not in target_market_keys:
                 continue
 
             outcomes = market.get("outcomes", [])
-            matched = []
+            by_point: Dict[float, Dict[str, Any]] = {}
 
             for outcome in outcomes:
-                if player_name_matches(
+                if not player_name_matches(
                     player_name,
                     outcome.get("description", ""),
                     outcome.get("participant", ""),
                     outcome.get("label", ""),
                     outcome.get("name", ""),
                 ):
-                    matched.append(outcome)
+                    continue
 
-            if not matched:
-                continue
+                try:
+                    point = float(outcome.get("point")) if outcome.get("point") is not None else None
+                except Exception:
+                    point = None
 
-            matched_market_keys.append(f"{book_key}:{market_key}")
+                if point is None:
+                    continue
 
-            this_line = None
-            this_over = None
-            this_under = None
+                try:
+                    price = int(outcome.get("price")) if outcome.get("price") is not None else None
+                except Exception:
+                    price = None
 
-            for outcome in matched:
                 name = normalize_name(outcome.get("name", ""))
                 desc = normalize_name(outcome.get("description", ""))
                 label = normalize_name(outcome.get("label", ""))
                 side = normalize_name(outcome.get("side", ""))
 
-                price = outcome.get("price")
-                point = outcome.get("point")
+                over_hit = "over" in {name, desc, label, side}
+                under_hit = "under" in {name, desc, label, side}
 
-                try:
-                    price = int(price) if price is not None else None
-                except Exception:
-                    price = None
+                if point not in by_point:
+                    by_point[point] = {
+                        "over": None,
+                        "under": None,
+                        "market_key": market_key,
+                    }
 
-                try:
-                    point = float(point) if point is not None else None
-                except Exception:
-                    point = None
+                if over_hit:
+                    by_point[point]["over"] = price
+                elif under_hit:
+                    by_point[point]["under"] = price
 
-                if point is not None:
-                    this_line = point
+            for point, info in by_point.items():
+                over_price = info["over"]
+                under_price = info["under"]
 
-                if "over" in {name, desc, label, side}:
-                    this_over = price
-                elif "under" in {name, desc, label, side}:
-                    this_under = price
+                if over_price is None or under_price is None:
+                    continue
 
-            if this_line is not None:
-                lines.append(this_line)
-            if this_over is not None:
-                overs.append(this_over)
-            if this_under is not None:
-                unders.append(this_under)
+                candidate = {
+                    "point": point,
+                    "over": over_price,
+                    "under": under_price,
+                    "market_key": info["market_key"],
+                    "score": closeness_to_even(over_price, under_price),
+                }
 
-            if this_line is not None or this_over is not None or this_under is not None:
-                books_used.append(book_key)
+                if best_candidate is None or candidate["score"] < best_candidate["score"]:
+                    best_candidate = candidate
 
-    median_line = round(float(pd.Series(lines).median()), 1) if lines else None
-    median_over = int(pd.Series(overs).median()) if overs else None
-    median_under = int(pd.Series(unders).median()) if unders else None
+        if best_candidate is not None:
+            selected_lines.append(best_candidate["point"])
+            selected_overs.append(best_candidate["over"])
+            selected_unders.append(best_candidate["under"])
+            books_used.append(book_key)
+            matched_market_keys.append(f"{book_key}:{best_candidate['market_key']}")
+
+    median_line = round(float(pd.Series(selected_lines).median()), 1) if selected_lines else None
+    median_over = int(pd.Series(selected_overs).median()) if selected_overs else None
+    median_under = int(pd.Series(selected_unders).median()) if selected_unders else None
     books = ", ".join(sorted(set(books_used))) if books_used else None
 
     return median_line, median_over, median_under, books, sorted(set(matched_market_keys))
@@ -883,205 +915,206 @@ if st.button("Calculate Parlay", type="primary"):
     total_ev = 0.0
     included_legs: List[Dict[str, Any]] = []
 
-    if not API_KEY or API_KEY == "PASTE_YOUR_ODDS_API_KEY_HERE":
-        st.error("Paste your Odds API key into the API_KEY line near the top of the script.")
+    if not API_KEY:
+        st.error("No Odds API key found.")
         st.stop()
 
-    for pick in inputs:
-        player_name = pick["name"]
-        pid = get_player_id(player_name)
+    with st.spinner("Loading odds + stats..."):
+        for pick in inputs:
+            player_name = pick["name"]
+            pid = get_player_id(player_name)
 
-        if not pid:
-            st.warning(f"Could not find player ID for {player_name}.")
-            continue
+            if not pid:
+                st.warning(f"Could not find player ID for {player_name}.")
+                continue
 
-        games = fetch_recent_games(pid)
-        if games.empty:
-            st.warning(f"No recent game data for {player_name}.")
-            continue
+            games = fetch_recent_games(pid)
+            if games.empty:
+                st.warning(f"No recent game data for {player_name}.")
+                continue
 
-        team_abbrev = get_player_team(pid)
-        opponent = get_confirmed_opponent_today(team_abbrev)
+            team_abbrev = get_player_team(pid)
+            opponent = get_confirmed_opponent_today(team_abbrev)
 
-        if opponent is None:
-            st.warning(f"{player_name}: no confirmed game found on today's live NBA scoreboard. Skipping this player.")
-            continue
+            if opponent is None:
+                st.warning(f"{player_name}: no confirmed game found on today's live NBA scoreboard. Skipping this player.")
+                continue
 
-        factor = defense_map.get(opponent, 1.0)
-        props = fetch_player_props(player_name, team_abbrev, opponent)
+            factor = defense_map.get(opponent, 1.0)
+            props = fetch_player_props(player_name, team_abbrev, opponent)
 
-        avg_3pt = calculate_weighted_avg(games, "FG3M")
-        avg_pts = calculate_weighted_avg(games, "PTS")
+            avg_3pt = calculate_weighted_avg(games, "FG3M")
+            avg_pts = calculate_weighted_avg(games, "PTS")
 
-        smart_lines = build_smart_lines(
-            avg_3pt=avg_3pt,
-            avg_pts=avg_pts,
-            target_3pt=pick["target_3pt"],
-            target_pts=pick["target_pts"],
-            api_threes_line=props["threes_line"],
-            api_points_line=props["points_line"],
-        )
-
-        prob_3pt, adj_3pt = calculate_probability(avg_3pt, factor, pick["target_3pt"])
-        prob_pts, adj_pts = calculate_probability(avg_pts, 1.0, pick["target_pts"])
-
-        fair_3pt_odds = probability_to_fair_american(prob_3pt)
-        fair_pts_odds = probability_to_fair_american(prob_pts)
-
-        ev_3pt = calculate_ev(prob_3pt, american_to_decimal(props["threes_over"]))
-        ev_pts = calculate_ev(prob_pts, american_to_decimal(props["points_over"]))
-
-        if pick["leg_type"] == "3PT only":
-            total_prob *= prob_3pt / 100
-            included_legs.append({"player": player_name, "leg": f"3PT {pick['target_3pt']}+", "prob": prob_3pt})
-        elif pick["leg_type"] == "Points only":
-            total_prob *= prob_pts / 100
-            included_legs.append({"player": player_name, "leg": f"PTS {pick['target_pts']}+", "prob": prob_pts})
-        else:
-            total_prob *= prob_3pt / 100
-            total_prob *= prob_pts / 100
-            included_legs.append({"player": player_name, "leg": f"3PT {pick['target_3pt']}+", "prob": prob_3pt})
-            included_legs.append({"player": player_name, "leg": f"PTS {pick['target_pts']}+", "prob": prob_pts})
-
-        total_ev += (ev_3pt or 0) + (ev_pts or 0)
-
-        avg5_3 = games.head(5)["FG3M"].mean()
-        avg10_3 = games.head(10)["FG3M"].mean()
-        avg5_pts = games.head(5)["PTS"].mean()
-        avg10_pts = games.head(10)["PTS"].mean()
-
-        st.markdown("---")
-        st.subheader(f"{player_name} · {team_abbrev} vs {opponent}")
-
-        if props["books"] is None:
-            st.info(
-                f"No sportsbook player-prop prices returned for {player_name}. "
-                f"Using model fallback lines. Debug: {props.get('debug', 'None')}"
+            smart_lines = build_smart_lines(
+                avg_3pt=avg_3pt,
+                avg_pts=avg_pts,
+                target_3pt=pick["target_3pt"],
+                target_pts=pick["target_pts"],
+                api_threes_line=props["threes_line"],
+                api_points_line=props["points_line"],
             )
 
-        r1 = st.columns(4)
-        with r1[0]:
-            st.markdown(
-                metric_card(
-                    "Tonight 3PT line",
-                    safe_line_display(smart_lines["threes_line"]),
-                    subtext=smart_lines["threes_source"],
-                ),
-                unsafe_allow_html=True,
-            )
-        with r1[1]:
-            st.markdown(
-                metric_card(
-                    "Your 3PT target",
-                    str(pick["target_3pt"]),
-                    subtext=f"Fair odds: {safe_odds_display(fair_3pt_odds)}",
-                ),
-                unsafe_allow_html=True,
-            )
-        with r1[2]:
-            st.markdown(metric_card("3PT hit probability", f"{prob_3pt}%"), unsafe_allow_html=True)
-        with r1[3]:
-            if ev_3pt is None:
-                ev_text = "Model only"
-                ev_sub = f"Fair over: {safe_odds_display(fair_3pt_odds)}"
-                tone = "neutral"
+            prob_3pt, adj_3pt = calculate_probability(avg_3pt, factor, pick["target_3pt"])
+            prob_pts, adj_pts = calculate_probability(avg_pts, 1.0, pick["target_pts"])
+
+            fair_3pt_odds = probability_to_fair_american(prob_3pt)
+            fair_pts_odds = probability_to_fair_american(prob_pts)
+
+            ev_3pt = calculate_ev(prob_3pt, american_to_decimal(props["threes_over"]))
+            ev_pts = calculate_ev(prob_pts, american_to_decimal(props["points_over"]))
+
+            if pick["leg_type"] == "3PT only":
+                total_prob *= prob_3pt / 100
+                included_legs.append({"player": player_name, "leg": f"3PT {pick['target_3pt']}+", "prob": prob_3pt})
+            elif pick["leg_type"] == "Points only":
+                total_prob *= prob_pts / 100
+                included_legs.append({"player": player_name, "leg": f"PTS {pick['target_pts']}+", "prob": prob_pts})
             else:
-                ev_text = str(ev_3pt)
-                ev_sub = f"Book over: {safe_odds_display(props['threes_over'])}"
-                tone = "good" if ev_3pt > 0 else "bad"
-            st.markdown(metric_card("3PT EV", ev_text, tone, ev_sub), unsafe_allow_html=True)
+                total_prob *= prob_3pt / 100
+                total_prob *= prob_pts / 100
+                included_legs.append({"player": player_name, "leg": f"3PT {pick['target_3pt']}+", "prob": prob_3pt})
+                included_legs.append({"player": player_name, "leg": f"PTS {pick['target_pts']}+", "prob": prob_pts})
 
-        r2 = st.columns(4)
-        with r2[0]:
-            st.markdown(
-                metric_card(
-                    "Tonight points line",
-                    safe_line_display(smart_lines["points_line"]),
-                    subtext=smart_lines["points_source"],
-                ),
-                unsafe_allow_html=True,
-            )
-        with r2[1]:
-            st.markdown(
-                metric_card(
-                    "Your points target",
-                    str(pick["target_pts"]),
-                    subtext=f"Fair odds: {safe_odds_display(fair_pts_odds)}",
-                ),
-                unsafe_allow_html=True,
-            )
-        with r2[2]:
-            st.markdown(metric_card("Points hit probability", f"{prob_pts}%"), unsafe_allow_html=True)
-        with r2[3]:
-            if ev_pts is None:
-                ev_text = "Model only"
-                ev_sub = f"Fair over: {safe_odds_display(fair_pts_odds)}"
-                tone = "neutral"
-            else:
-                ev_text = str(ev_pts)
-                ev_sub = f"Book over: {safe_odds_display(props['points_over'])}"
-                tone = "good" if ev_pts > 0 else "bad"
-            st.markdown(metric_card("Points EV", ev_text, tone, ev_sub), unsafe_allow_html=True)
+            total_ev += (ev_3pt or 0) + (ev_pts or 0)
 
-        info = st.columns(4)
-        info[0].write(f"**Expected 3PTs:** {adj_3pt:.2f}")
-        info[1].write(f"**Expected points:** {adj_pts:.2f}")
-        info[2].write(f"**Books found:** {props['books'] or 'None returned by API'}")
-        info[3].write(f"**Parlay mode:** {pick['leg_type']}")
+            avg5_3 = games.head(5)["FG3M"].mean()
+            avg10_3 = games.head(10)["FG3M"].mean()
+            avg5_pts = games.head(5)["PTS"].mean()
+            avg10_pts = games.head(10)["PTS"].mean()
 
-        with st.expander("Advanced analysis", expanded=False):
-            a1, a2 = st.columns(2)
-            with a1:
-                st.write(f"Last 5 average 3PTM: {avg5_3:.2f}")
-                st.write(f"Last 10 average 3PTM: {avg10_3:.2f}")
-                st.write(f"3PT line source: {smart_lines['threes_source']}")
-                st.write(f"Book over odds (3PT): {safe_odds_display(props['threes_over'])}")
-                st.write(f"Book under odds (3PT): {safe_odds_display(props['threes_under'])}")
-                st.write(f"Model fair over (3PT): {safe_odds_display(fair_3pt_odds)}")
-            with a2:
-                st.write(f"Last 5 average points: {avg5_pts:.2f}")
-                st.write(f"Last 10 average points: {avg10_pts:.2f}")
-                st.write(f"Points line source: {smart_lines['points_source']}")
-                st.write(f"Book over odds (points): {safe_odds_display(props['points_over'])}")
-                st.write(f"Book under odds (points): {safe_odds_display(props['points_under'])}")
-                st.write(f"Model fair over (points): {safe_odds_display(fair_pts_odds)}")
+            st.markdown("---")
+            st.subheader(f"{player_name} · {team_abbrev} vs {opponent}")
 
-            st.write(f"**Matched event id:** {props['event_id'] or 'None'}")
-            st.write(f"**Odds debug:** {props.get('debug', 'None')}")
-            st.write(f"**Props source:** {props.get('props_source', 'None')}")
-
-            props_meta = props.get("api_meta", {}).get("props_meta", {})
-            if props_meta:
-                st.write(
-                    f"**Props request status:** {props_meta.get('status_code')} | "
-                    f"remaining={props_meta.get('requests_remaining')} | "
-                    f"used={props_meta.get('requests_used')} | "
-                    f"last_cost={props_meta.get('requests_last')}"
+            if props["books"] is None:
+                st.info(
+                    f"No sportsbook player-prop prices returned for {player_name}. "
+                    f"Using model fallback lines. Debug: {props.get('debug', 'None')}"
                 )
-                st.write(f"**Props request error:** {props_meta.get('error')}")
 
-            if props.get("matched_point_markets"):
-                st.write(f"**Matched point markets:** {', '.join(props['matched_point_markets'])}")
-            if props.get("matched_three_markets"):
-                st.write(f"**Matched three markets:** {', '.join(props['matched_three_markets'])}")
+            r1 = st.columns(4)
+            with r1[0]:
+                st.markdown(
+                    metric_card(
+                        "Tonight 3PT line",
+                        safe_line_display(smart_lines["threes_line"]),
+                        subtext=smart_lines["threes_source"],
+                    ),
+                    unsafe_allow_html=True,
+                )
+            with r1[1]:
+                st.markdown(
+                    metric_card(
+                        "Your 3PT target",
+                        str(pick["target_3pt"]),
+                        subtext=f"Fair odds: {safe_odds_display(fair_3pt_odds)}",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            with r1[2]:
+                st.markdown(metric_card("3PT hit probability", f"{prob_3pt}%"), unsafe_allow_html=True)
+            with r1[3]:
+                if ev_3pt is None:
+                    ev_text = "Model only"
+                    ev_sub = f"Fair over: {safe_odds_display(fair_3pt_odds)}"
+                    tone = "neutral"
+                else:
+                    ev_text = str(ev_3pt)
+                    ev_sub = f"Book over: {safe_odds_display(props['threes_over'])}"
+                    tone = "good" if ev_3pt > 0 else "bad"
+                st.markdown(metric_card("3PT EV", ev_text, tone, ev_sub), unsafe_allow_html=True)
 
-            if props.get("available_market_summary"):
-                st.write("**Available market keys returned by books:**")
-                for item in props["available_market_summary"][:20]:
-                    st.code(item)
+            r2 = st.columns(4)
+            with r2[0]:
+                st.markdown(
+                    metric_card(
+                        "Tonight points line",
+                        safe_line_display(smart_lines["points_line"]),
+                        subtext=smart_lines["points_source"],
+                    ),
+                    unsafe_allow_html=True,
+                )
+            with r2[1]:
+                st.markdown(
+                    metric_card(
+                        "Your points target",
+                        str(pick["target_pts"]),
+                        subtext=f"Fair odds: {safe_odds_display(fair_pts_odds)}",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            with r2[2]:
+                st.markdown(metric_card("Points hit probability", f"{prob_pts}%"), unsafe_allow_html=True)
+            with r2[3]:
+                if ev_pts is None:
+                    ev_text = "Model only"
+                    ev_sub = f"Fair over: {safe_odds_display(fair_pts_odds)}"
+                    tone = "neutral"
+                else:
+                    ev_text = str(ev_pts)
+                    ev_sub = f"Book over: {safe_odds_display(props['points_over'])}"
+                    tone = "good" if ev_pts > 0 else "bad"
+                st.markdown(metric_card("Points EV", ev_text, tone, ev_sub), unsafe_allow_html=True)
 
-            st.altair_chart(
-                build_stat_chart(games, "FG3M", smart_lines["threes_line"], pick["target_3pt"], "3PT Made"),
-                use_container_width=True,
-            )
-            st.altair_chart(
-                build_stat_chart(games, "PTS", smart_lines["points_line"], pick["target_pts"], "Points"),
-                use_container_width=True,
-            )
+            info = st.columns(4)
+            info[0].write(f"**Expected 3PTs:** {adj_3pt:.2f}")
+            info[1].write(f"**Expected points:** {adj_pts:.2f}")
+            info[2].write(f"**Books found:** {props['books'] or 'None returned by API'}")
+            info[3].write(f"**Parlay mode:** {pick['leg_type']}")
 
-            st.markdown("**Raw odds inspector**")
-            for line in inspect_event_props(team_abbrev, opponent, player_name):
-                st.code(line)
+            with st.expander("Advanced analysis", expanded=False):
+                a1, a2 = st.columns(2)
+                with a1:
+                    st.write(f"Last 5 average 3PTM: {avg5_3:.2f}")
+                    st.write(f"Last 10 average 3PTM: {avg10_3:.2f}")
+                    st.write(f"3PT line source: {smart_lines['threes_source']}")
+                    st.write(f"Book over odds (3PT): {safe_odds_display(props['threes_over'])}")
+                    st.write(f"Book under odds (3PT): {safe_odds_display(props['threes_under'])}")
+                    st.write(f"Model fair over (3PT): {safe_odds_display(fair_3pt_odds)}")
+                with a2:
+                    st.write(f"Last 5 average points: {avg5_pts:.2f}")
+                    st.write(f"Last 10 average points: {avg10_pts:.2f}")
+                    st.write(f"Points line source: {smart_lines['points_source']}")
+                    st.write(f"Book over odds (points): {safe_odds_display(props['points_over'])}")
+                    st.write(f"Book under odds (points): {safe_odds_display(props['points_under'])}")
+                    st.write(f"Model fair over (points): {safe_odds_display(fair_pts_odds)}")
+
+                st.write(f"**Matched event id:** {props['event_id'] or 'None'}")
+                st.write(f"**Odds debug:** {props.get('debug', 'None')}")
+                st.write(f"**Props source:** {props.get('props_source', 'None')}")
+
+                props_meta = props.get("api_meta", {}).get("props_meta", {})
+                if props_meta:
+                    st.write(
+                        f"**Props request status:** {props_meta.get('status_code')} | "
+                        f"remaining={props_meta.get('requests_remaining')} | "
+                        f"used={props_meta.get('requests_used')} | "
+                        f"last_cost={props_meta.get('requests_last')}"
+                    )
+                    st.write(f"**Props request error:** {props_meta.get('error')}")
+
+                if props.get("matched_point_markets"):
+                    st.write(f"**Matched point markets:** {', '.join(props['matched_point_markets'])}")
+                if props.get("matched_three_markets"):
+                    st.write(f"**Matched three markets:** {', '.join(props['matched_three_markets'])}")
+
+                if props.get("available_market_summary"):
+                    st.write("**Available market keys returned by books:**")
+                    for item in props["available_market_summary"][:20]:
+                        st.code(item)
+
+                st.altair_chart(
+                    build_stat_chart(games, "FG3M", smart_lines["threes_line"], pick["target_3pt"], "3PT Made"),
+                    use_container_width=True,
+                )
+                st.altair_chart(
+                    build_stat_chart(games, "PTS", smart_lines["points_line"], pick["target_pts"], "Points"),
+                    use_container_width=True,
+                )
+
+                st.markdown("**Raw odds inspector**")
+                for line in inspect_event_props(team_abbrev, opponent, player_name):
+                    st.code(line)
 
     if not included_legs:
         total_prob = 0.0
