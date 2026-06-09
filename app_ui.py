@@ -152,10 +152,12 @@ HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 # This disk cache survives Streamlit reruns and `streamlit cache clear`, so repeated
 # button clicks reuse the same successful response instead of spending credits again.
 ODDS_CACHE_FILE = Path("odds_api_cache.json")
-ODDS_CACHE_DEFAULT_TTL_SECONDS = 30 * 60       # player props / odds refresh window
-ODDS_CACHE_EVENTS_TTL_SECONDS = 12 * 60 * 60   # event list changes slowly
-ODDS_CACHE_H2H_TTL_SECONDS = 2 * 60 * 60       # game list / h2h lines
-ODDS_CACHE_MAX_STALE_SECONDS = 7 * 24 * 60 * 60
+ODDS_CACHE_DAILY_MODE = True
+ODDS_CACHE_DEFAULT_TTL_SECONDS = 24 * 60 * 60       # daily odds snapshot: one pull per request per day
+ODDS_CACHE_EVENTS_TTL_SECONDS = 24 * 60 * 60        # event list is reused for the full day
+ODDS_CACHE_H2H_TTL_SECONDS = 24 * 60 * 60           # game list / h2h lines reused for the full day
+ODDS_CACHE_MAX_STALE_SECONDS = 7 * 24 * 60 * 60     # fallback to last good response if quota/API fails
+ODDS_FORCE_REFRESH_SECONDS = 180                    # manual refresh window; uses API credits intentionally
 
 
 # =========================
@@ -1399,6 +1401,33 @@ def _odds_cache_key(url: str, params: Optional[Dict[str, Any]] = None) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _odds_cache_day() -> str:
+    # Uses the machine/deployment timezone. For your local laptop this will be your local day.
+    return time.strftime("%Y-%m-%d")
+
+
+def _odds_force_refresh_active() -> bool:
+    try:
+        return time.time() < float(st.session_state.get("odds_force_refresh_until", 0))
+    except Exception:
+        return False
+
+
+def _format_cache_age(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "No snapshot yet"
+    seconds = max(int(seconds), 0)
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
 def _read_odds_cache() -> Dict[str, Any]:
     try:
         if ODDS_CACHE_FILE.exists():
@@ -1440,12 +1469,21 @@ def _get_cached_odds_response(url: str, params: Dict[str, Any], allow_stale: boo
 
     age = time.time() - float(entry.get("saved_at", 0))
     ttl = _odds_cache_ttl(url, params)
-    if age <= ttl or (allow_stale and age <= ODDS_CACHE_MAX_STALE_SECONDS):
+    saved_day = str(entry.get("saved_day", ""))
+    today = _odds_cache_day()
+
+    # Daily snapshot mode: use the first successful pull for today's request all day.
+    # Button clicks reuse this file instead of spending another API credit.
+    is_today_snapshot = bool(ODDS_CACHE_DAILY_MODE and saved_day == today)
+
+    if is_today_snapshot or age <= ttl or (allow_stale and age <= ODDS_CACHE_MAX_STALE_SECONDS):
         meta = dict(entry.get("meta") or {})
         meta["ok"] = True
         meta["cache_hit"] = True
         meta["cache_age_seconds"] = int(age)
-        meta["cache_stale"] = age > ttl
+        meta["cache_saved_day"] = saved_day or "legacy"
+        meta["cache_stale"] = (not is_today_snapshot) and age > ttl
+        meta["daily_snapshot"] = is_today_snapshot
         return entry.get("data"), meta
     return None, None
 
@@ -1457,6 +1495,7 @@ def _save_odds_response(url: str, params: Dict[str, Any], data: Any, meta: Dict[
     clean_meta.pop("error", None)
     cache[key] = {
         "saved_at": time.time(),
+        "saved_day": _odds_cache_day(),
         "url": url,
         "params": params,
         "data": data,
@@ -1472,12 +1511,14 @@ def _save_odds_response(url: str, params: Dict[str, Any], data: Any, meta: Dict[
 
 
 def odds_api_get(url: str, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-    # 1) Fresh local disk cache first. This is the main quota saver.
-    cached_data, cached_meta = _get_cached_odds_response(url, params, allow_stale=False)
-    if cached_meta is not None:
-        return cached_data, cached_meta
+    # 1) Daily local disk cache first. This is the main quota saver.
+    # Manual refresh intentionally bypasses it for a short window.
+    if not _odds_force_refresh_active():
+        cached_data, cached_meta = _get_cached_odds_response(url, params, allow_stale=False)
+        if cached_meta is not None:
+            return cached_data, cached_meta
 
-    meta = {"ok": False, "status_code": None, "error": None, "cache_hit": False}
+    meta = {"ok": False, "status_code": None, "error": None, "cache_hit": False, "force_refresh": _odds_force_refresh_active()}
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         meta["status_code"] = resp.status_code
@@ -5461,6 +5502,81 @@ def _fanduel_odds_payload(sport: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
+def get_odds_cache_summary() -> Dict[str, Any]:
+    cache = _read_odds_cache()
+    today = _odds_cache_day()
+    today_entries = []
+    all_entries = []
+    for entry in cache.values():
+        if not isinstance(entry, dict):
+            continue
+        saved_at = float(entry.get("saved_at", 0) or 0)
+        saved_day = str(entry.get("saved_day", ""))
+        all_entries.append(entry)
+        if saved_day == today:
+            today_entries.append(entry)
+
+    latest_today = max([float(e.get("saved_at", 0) or 0) for e in today_entries], default=None)
+    latest_any = max([float(e.get("saved_at", 0) or 0) for e in all_entries], default=None)
+    return {
+        "today": today,
+        "today_count": len(today_entries),
+        "total_count": len(all_entries),
+        "latest_today_age": None if latest_today is None else time.time() - latest_today,
+        "latest_any_age": None if latest_any is None else time.time() - latest_any,
+    }
+
+
+def clear_todays_odds_snapshot() -> int:
+    cache = _read_odds_cache()
+    today = _odds_cache_day()
+    kept = {}
+    removed = 0
+    for key, entry in cache.items():
+        if isinstance(entry, dict) and str(entry.get("saved_day", "")) == today:
+            removed += 1
+        else:
+            kept[key] = entry
+    _write_odds_cache(kept)
+    return removed
+
+
+def render_daily_odds_snapshot_controls() -> None:
+    summary = get_odds_cache_summary()
+    latest_age = summary.get("latest_today_age")
+    status_text = "Ready" if summary.get("today_count", 0) else "No daily snapshot yet"
+    status_sub = (
+        f"{summary.get('today_count', 0)} cached odds responses today • Latest pull {_format_cache_age(latest_age)}"
+        if summary.get("today_count", 0)
+        else "First odds lookup today will create the daily snapshot automatically."
+    )
+
+    st.markdown(
+        f"""
+        <div class="quick-card" style="margin-top: 0.65rem; margin-bottom: 0.8rem;">
+            <div class="quick-card-title">Daily Odds Snapshot</div>
+            <div class="quick-card-main">{status_text}</div>
+            <div class="quick-card-sub">{status_sub}</div>
+            <div class="quick-card-sub">Mode: one successful pull per unique odds request per day. Buttons reuse saved data instead of burning credits.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if st.button("Refresh Today's Odds", key="refresh_daily_odds_snapshot", help="Uses API credits intentionally, then saves a fresh daily snapshot."):
+            removed = clear_todays_odds_snapshot()
+            st.session_state["odds_force_refresh_until"] = time.time() + ODDS_FORCE_REFRESH_SECONDS
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.success(f"Today's odds snapshot was reset ({removed} cached responses cleared). The next odds load will pull fresh data and save it for the day.")
+    with c2:
+        st.caption("Leave this alone for normal use. Use it only when you want fresh lines after injuries/news or when odds changed.")
+
 # =========================
 # UI
 # =========================
@@ -5537,6 +5653,8 @@ landing_cols[3].markdown(
     unsafe_allow_html=True,
 )
 
+st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
+render_daily_odds_snapshot_controls()
 st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
 
 
