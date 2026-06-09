@@ -2917,48 +2917,265 @@ def render_candidate_table(df: pd.DataFrame):
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
+
+def _display_value(value: Any, suffix: str = "") -> str:
+    if value is None:
+        return "—"
+    try:
+        if isinstance(value, float):
+            if math.isnan(value):
+                return "—"
+            if abs(value) >= 100:
+                return f"{value:.0f}{suffix}"
+            return f"{value:.2f}{suffix}".rstrip("0").rstrip(".") + suffix if suffix and not str(value).endswith(suffix) else f"{value:.2f}".rstrip("0").rstrip(".")
+        return f"{value}{suffix}"
+    except Exception:
+        return f"{value}{suffix}"
+
+
+def _fmt_pct(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.1f}%"
+    except Exception:
+        return str(value)
+
+
+def _edge_grade(prob: float, projected: Optional[float], line: Optional[float], ev: Optional[float]) -> str:
+    edge_to_line = 0.0
+    try:
+        if projected is not None and line is not None:
+            edge_to_line = float(projected) - float(line)
+    except Exception:
+        edge_to_line = 0.0
+
+    ev_val = ev or 0.0
+    score = (prob / 100) + max(edge_to_line, 0) * 0.08 + max(ev_val, 0) * 0.25
+    if score >= 0.90:
+        return "A"
+    if score >= 0.78:
+        return "B+"
+    if score >= 0.68:
+        return "B"
+    if score >= 0.58:
+        return "C+"
+    return "C"
+
+
+def _trend_text(last5: Any, last10: Any, season: Any) -> str:
+    try:
+        last5_f = float(last5)
+        last10_f = float(last10)
+        season_f = float(season)
+    except Exception:
+        return "Trend data unavailable"
+
+    if last5_f > last10_f > season_f:
+        return "Recent form is climbing versus season baseline."
+    if last5_f < last10_f < season_f:
+        return "Recent form is cooling versus season baseline."
+    if last5_f > season_f:
+        return "Recent form is above season baseline."
+    if last5_f < season_f:
+        return "Recent form is below season baseline."
+    return "Recent form is close to season baseline."
+
+
+def _factor_rows_for_leg(leg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    factors = leg.get("model_factors") if isinstance(leg.get("model_factors"), dict) else {}
+    projected = factors.get("projected_stat", leg.get("expected_stat"))
+    line = factors.get("sportsbook_line", leg.get("line"))
+    target = factors.get("target_needed", sportsbook_line_to_target(line) if line is not None else None)
+    prob = factors.get("model_prob", leg.get("model_prob"))
+    implied = factors.get("market_implied_prob", None)
+
+    rows: List[Dict[str, Any]] = []
+
+    def add(factor: str, value: Any, impact: str):
+        if value is not None and value != "":
+            rows.append({"Factor": factor, "Value": value, "Impact on probability": impact})
+
+    add("Model hit probability", _fmt_pct(prob), "Final calibrated chance for this leg.")
+    add("Projected stat", _display_value(projected), "Main driver: projection versus the needed target.")
+    add("Sportsbook line", safe_line_display(line) if line is not None else None, "The market line the model is evaluating.")
+    add("Target needed", target, "Over bets usually need floor(line) + 1.")
+
+    if projected is not None and target is not None:
+        try:
+            edge = float(projected) - float(target)
+            add("Projection edge", f"{edge:+.2f}", "Positive edge means model projects above the required target.")
+        except Exception:
+            pass
+
+    add("Season average", factors.get("season_avg"), "Stabilizes the projection so recent spikes do not overrule the full sample.")
+    add("Last 10 average", factors.get("last10_avg"), "Captures current role/form without overreacting to one game.")
+    add("Last 5 average", factors.get("last5_avg"), "Captures short-term trend and hot/cold stretch.")
+    add("Recent trend", _trend_text(factors.get("last5_avg"), factors.get("last10_avg"), factors.get("season_avg")), "Helps explain whether recent form is improving or fading.")
+    add("Expected minutes", factors.get("expected_minutes"), "NBA opportunity input: more minutes means more stat chances.")
+    add("Expected TOI", factors.get("expected_toi"), "NHL opportunity input: more ice time means more stat chances.")
+    add("Stat per minute", factors.get("stat_per_min"), "Efficiency/volume rate multiplied by expected opportunity.")
+    add("Opportunity projection", factors.get("opportunity_projection"), "Projection based on rate × expected minutes/TOI.")
+    add("Opponent adjustment", factors.get("opponent_adjustment"), "Matchup adjustment applied to the projection.")
+    add("Volume adjustment", factors.get("volume_adjustment"), "Shot/attempt volume adjustment when available.")
+    add("Market implied probability", _fmt_pct(implied) if implied is not None else None, "Book's implied probability, used as a reality check.")
+    add("Book odds", safe_odds_display(leg.get("book_over_odds")), "Available payout for the model probability.")
+    add("EV", leg.get("ev"), "Positive EV means model probability is better than the price implies.")
+    return rows
+
+
+def compact_factor_text(factors: Any) -> str:
+    if not isinstance(factors, dict):
+        return "Model details unavailable for this leg."
+    projected = factors.get("projected_stat")
+    target = factors.get("target_needed")
+    season = factors.get("season_avg")
+    last10 = factors.get("last10_avg")
+    last5 = factors.get("last5_avg")
+    opportunity = factors.get("expected_minutes") or factors.get("expected_toi")
+    opp_adj = factors.get("opponent_adjustment")
+    parts = []
+    if projected is not None and target is not None:
+        parts.append(f"Projected {projected} vs target {target}")
+    if season is not None and last10 is not None and last5 is not None:
+        parts.append(f"form blend: season {season}, L10 {last10}, L5 {last5}")
+    if opportunity is not None:
+        parts.append(f"opportunity {opportunity}")
+    if opp_adj:
+        parts.append(f"matchup {opp_adj}")
+    return "; ".join(parts) if parts else str(factors.get("explanation_summary") or "Model details unavailable for this leg.")
+
+
 def render_leg_model_explanation(leg: Dict[str, Any], index: Optional[int] = None):
     title_prefix = f"Leg {index}: " if index is not None else ""
     title = f"{title_prefix}{leg.get('leg_label', 'Selected leg')}"
-    factors = leg.get("model_factors")
-    if not isinstance(factors, dict):
-        st.caption(f"{title} — model detail unavailable for this source.")
+    factors = leg.get("model_factors") if isinstance(leg.get("model_factors"), dict) else {}
+
+    if not factors:
+        st.caption(f"{title} — detailed model factors unavailable for this odds source/cache entry.")
         return
 
     with st.expander(f"Why this probability? — {title}", expanded=False):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Model Prob", f"{factors.get('model_prob', leg.get('model_prob', 0))}%")
-        c2.metric("Projected", factors.get("projected_stat", leg.get("expected_stat", "—")))
-        c3.metric("Line", factors.get("sportsbook_line", leg.get("line", "—")))
-        c4.metric("Target", factors.get("target_needed", "—"))
-        st.write(factors.get("explanation_summary", "The projection blends form, opportunity and matchup context."))
-        detail_rows = []
-        for label, key in [("Season avg", "season_avg"), ("Last 10 avg", "last10_avg"), ("Last 5 avg", "last5_avg"), ("Expected minutes", "expected_minutes"), ("Expected TOI", "expected_toi"), ("Stat per minute", "stat_per_min"), ("Opportunity projection", "opportunity_projection"), ("Opponent adjustment", "opponent_adjustment"), ("Volume adjustment", "volume_adjustment"), ("Market implied prob", "market_implied_prob")]:
-            if key in factors and factors.get(key) is not None:
-                val = factors.get(key)
-                if key == "market_implied_prob":
-                    val = f"{val}%"
-                detail_rows.append({"Factor": label, "Value": val})
-        if detail_rows:
-            st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+        projected = factors.get("projected_stat", leg.get("expected_stat"))
+        line = factors.get("sportsbook_line", leg.get("line"))
+        target = factors.get("target_needed", sportsbook_line_to_target(line) if line is not None else None)
+        prob = float(factors.get("model_prob", leg.get("model_prob", 0)) or 0)
+        ev = leg.get("ev")
+        grade = _edge_grade(prob, projected, line, ev)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Model Prob", f"{prob:.1f}%")
+        c2.metric("Projected", _display_value(projected))
+        c3.metric("Line", safe_line_display(line) if line is not None else "—")
+        c4.metric("Target", target if target is not None else "—")
+        c5.metric("Confidence", grade)
+
+        st.markdown(f"**Model read:** {compact_factor_text(factors)}")
+
+        rows = _factor_rows_for_leg(leg)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        risks = []
+        try:
+            if projected is not None and target is not None and float(projected) - float(target) < 0.35:
+                risks.append("Projection edge is thin, so small role/minute changes can flip the pick.")
+        except Exception:
+            pass
+        if leg.get("book_over_odds") is not None and leg.get("book_over_odds") <= -250:
+            risks.append("Heavy favorite price can reduce value even when hit probability is high.")
+        if factors.get("last5_avg") is not None and factors.get("season_avg") is not None:
+            try:
+                if float(factors["last5_avg"]) > float(factors["season_avg"]) * 1.45:
+                    risks.append("Recent form is far above season average and may regress.")
+            except Exception:
+                pass
+        if risks:
+            st.markdown("**Key risks:**")
+            for r in risks:
+                st.caption(f"⚠ {r}")
+
 
 def render_parlay_probability_explanation(p: Dict[str, Any]):
     legs = p.get("legs", [])
-    with st.expander("Why this parlay probability?", expanded=False):
-        st.write("The parlay hit probability multiplies each leg's calibrated model probability. The correlation penalty is shown separately and is used in scoring/ranking so same-game or same-team parlays are not overvalued.")
+    with st.expander("Full parlay probability breakdown — why this %?", expanded=True):
         raw_prob = 1.0
-        rows = []
-        for leg in legs:
+        summary_rows = []
+        for i, leg in enumerate(legs, start=1):
             prob = float(leg.get("model_prob", 0) or 0)
             raw_prob *= prob / 100
-            rows.append({"Leg": leg.get("leg_label"), "Model Prob %": prob, "Projected": leg.get("expected_stat"), "Line": leg.get("line"), "Book Odds": safe_odds_display(leg.get("book_over_odds")), "Why": compact_factor_text(leg.get("model_factors"))})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Raw multiplied probability", f"{round(raw_prob * 100, 2)}%")
-        c2.metric("Displayed probability", f"{p.get('combined_prob', 0)}%")
-        c3.metric("Correlation penalty", p.get("correlation_penalty", 0))
+            factors = leg.get("model_factors") if isinstance(leg.get("model_factors"), dict) else {}
+            projected = factors.get("projected_stat", leg.get("expected_stat"))
+            line = factors.get("sportsbook_line", leg.get("line"))
+            target = factors.get("target_needed", sportsbook_line_to_target(line) if line is not None else None)
+            try:
+                edge_vs_target = round(float(projected) - float(target), 2) if projected is not None and target is not None else None
+            except Exception:
+                edge_vs_target = None
+            summary_rows.append(
+                {
+                    "#": i,
+                    "Leg": leg.get("leg_label"),
+                    "Prob %": round(prob, 2),
+                    "Projected": projected,
+                    "Line": line,
+                    "Target": target,
+                    "Edge vs Target": edge_vs_target,
+                    "Odds": safe_odds_display(leg.get("book_over_odds")),
+                    "Top reason": compact_factor_text(factors),
+                }
+            )
+
+        raw_pct = round(raw_prob * 100, 2)
+        displayed_pct = p.get("combined_prob", raw_pct)
+        penalty = p.get("correlation_penalty", 0)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Raw multiplied probability", f"{raw_pct}%")
+        c2.metric("Displayed probability", f"{displayed_pct}%")
+        c3.metric("Correlation penalty", penalty)
+        c4.metric("Book odds", safe_odds_display(p.get("combined_american_odds")))
+
+        st.markdown(
+            "The raw probability multiplies each leg's model hit rate. "
+            "The app also shows correlation risk so same-game or same-team legs are not treated as fully independent."
+        )
+
+        if summary_rows:
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        st.markdown("**Parlay math:**")
+        if legs:
+            probs = [float(leg.get("model_prob", 0) or 0) for leg in legs]
+            math_line = " × ".join([f"{p0:.1f}%" for p0 in probs])
+            st.code(f"{math_line} = {raw_pct}% raw hit probability")
+
+        st.markdown("**What is helping this parlay most:**")
+        helpers = []
+        for leg in legs:
+            factors = leg.get("model_factors") if isinstance(leg.get("model_factors"), dict) else {}
+            if factors:
+                helpers.append(f"✓ {leg.get('leg_label')}: {compact_factor_text(factors)}")
+        if helpers:
+            for h in helpers:
+                st.caption(h)
+        else:
+            st.caption("Detailed model factor data is unavailable for these legs, likely because they came from a cached/fallback odds source.")
+
+        risks = []
+        if penalty and float(penalty) > 0:
+            risks.append(f"Correlation penalty of {penalty} because one or more legs share game/team context.")
+        if p.get("parlay_size", len(legs)) >= 3:
+            risks.append("Three-leg parlays compound variance quickly even when each individual leg is strong.")
+        if p.get("parlay_ev", 0) < 0:
+            risks.append("Parlay EV is negative based on model probability versus payout.")
+        if risks:
+            st.markdown("**Key risks:**")
+            for r in risks:
+                st.caption(f"⚠ {r}")
+
         for idx, leg in enumerate(legs, start=1):
             render_leg_model_explanation(leg, idx)
+
 
 def render_selected_parlays(selected_parlays: Dict[str, Dict[str, Any]]):
     if not selected_parlays:
@@ -2996,13 +3213,16 @@ def render_selected_parlays(selected_parlays: Dict[str, Dict[str, Any]]):
                     "Opp": leg["opponent"],
                     "Book Odds": safe_odds_display(leg["book_over_odds"]),
                     "Model Prob %": leg["model_prob"],
+                    "Projected": leg.get("expected_stat"),
+                    "Line": leg.get("line"),
                     "EV": leg["ev"],
-                    "Leg Score": leg["leg_score"],
+                    "Top Reason": compact_factor_text(leg.get("model_factors")),
                 }
                 for leg in p["legs"]
             ]
         )
         st.dataframe(legs_table, use_container_width=True, hide_index=True)
+        render_parlay_probability_explanation(p)
 
 # =========================
 # MANUAL BUILDER HELPERS
