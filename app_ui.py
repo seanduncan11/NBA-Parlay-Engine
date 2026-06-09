@@ -444,9 +444,32 @@ st.markdown(
         color: #334155;
     }
 
+    div[data-testid="stTabs"] [role="tablist"] {
+        gap: 12px !important;
+        border-bottom: 1px solid rgba(203,213,225,0.95) !important;
+        padding: 10px 4px 12px 4px !important;
+        margin: 10px 0 18px 0 !important;
+    }
+
+    div[data-testid="stTabs"] button {
+        background: rgba(255,255,255,0.92) !important;
+        border: 1px solid rgba(203,213,225,0.95) !important;
+        box-shadow: 0 10px 24px rgba(15,23,42,0.07) !important;
+        min-width: 118px !important;
+        justify-content: center !important;
+        font-size: 15px !important;
+    }
+
     div[data-testid="stTabs"] button[aria-selected="true"] {
-        background: #0f172a;
-        color: white;
+        background: linear-gradient(135deg, #0f172a, #1d4ed8) !important;
+        color: white !important;
+        border-color: rgba(37,99,235,0.45) !important;
+        box-shadow: 0 12px 28px rgba(37,99,235,0.22) !important;
+        transform: translateY(-1px);
+    }
+
+    div[data-testid="stTabs"] button[aria-selected="true"] * {
+        color: white !important;
     }
 
     .stButton > button {
@@ -490,7 +513,7 @@ st.markdown(
 
     /* Parlay math/readability fixes: dark blocks should always have bright text. */
     .parlay-math-card {
-        background: #0f172a !important;
+        background: linear-gradient(135deg, #020617, #0f172a) !important;
         color: #ffffff !important;
         border: 1px solid rgba(148,163,184,0.35) !important;
         border-radius: 14px !important;
@@ -3436,7 +3459,7 @@ def render_parlay_probability_explanation(p: Dict[str, Any]):
             probs = [float(leg.get("model_prob", 0) or 0) for leg in legs]
             math_line = " × ".join([f"{p0:.1f}%" for p0 in probs])
             st.markdown(
-                f'<div class="parlay-math-card">{math_line} = {raw_pct}% raw hit probability</div>',
+                f'<div class="parlay-math-card" style="background:linear-gradient(135deg,#020617,#0f172a) !important; color:#ffffff !important;"><span style="color:#ffffff !important;">{math_line} = {raw_pct}% raw hit probability</span></div>',
                 unsafe_allow_html=True,
             )
 
@@ -6098,6 +6121,34 @@ def render_daily_odds_snapshot_controls() -> None:
     with c2:
         st.caption("Leave this alone for normal use. Refreshing is password protected so shared users cannot run through your API credits. Use it only after injuries/news or when odds changed.")
 
+
+def get_cached_today_game_counts() -> Dict[str, int]:
+    """Read saved daily odds snapshots and count today's NBA/NHL games without spending API credits."""
+    counts = {"NBA": 0, "NHL": 0}
+    cache = _read_odds_cache()
+    today = _odds_cache_day()
+
+    for entry in cache.values():
+        if not isinstance(entry, dict) or str(entry.get("saved_day", "")) != today:
+            continue
+
+        url = str(entry.get("url", "")).lower()
+        params = entry.get("params") or {}
+        markets = str(params.get("markets", "")).lower()
+        data = entry.get("data")
+
+        if not isinstance(data, list):
+            continue
+        if markets not in {"h2h", ""}:
+            continue
+
+        if "basketball_nba" in url:
+            counts["NBA"] = max(counts["NBA"], len(data))
+        elif "icehockey_nhl" in url:
+            counts["NHL"] = max(counts["NHL"], len(data))
+
+    return counts
+
 def render_home_status_bar() -> None:
     summary = get_odds_cache_summary()
     latest_age = summary.get("latest_today_age")
@@ -6105,6 +6156,10 @@ def render_home_status_bar() -> None:
     today_count = int(summary.get("today_count", 0) or 0)
     cache_main = "Active" if today_count else "Waiting"
     cache_sub = f"{today_count} saved pulls today" if today_count else "First pull creates snapshot"
+    game_counts = get_cached_today_game_counts()
+    games_main = f"NBA {game_counts.get('NBA', 0)} • NHL {game_counts.get('NHL', 0)}"
+    if game_counts.get('NBA', 0) == 0 and game_counts.get('NHL', 0) == 0:
+        games_main = "Load odds to count"
 
     st.markdown(
         f'''
@@ -6126,11 +6181,11 @@ def render_home_status_bar() -> None:
                 </div>
             </div>
             <div class="status-pill">
-                <div class="status-icon">🏀</div>
+                <div class="status-icon">🏟️</div>
                 <div>
-                    <div class="status-label">Markets</div>
-                    <div class="status-main">NBA + NHL</div>
-                    <div class="status-sub">Points, 3PT, shots, goals</div>
+                    <div class="status-label">Today's Games</div>
+                    <div class="status-main">{games_main}</div>
+                    <div class="status-sub">From saved daily odds snapshot</div>
                 </div>
             </div>
             <div class="status-pill">
@@ -6733,7 +6788,7 @@ def get_manual_nba_player_props(
 
     return props
 
-nba_tab, nhl_tab = st.tabs(["NBA", "NHL"])
+nba_tab, nhl_tab = st.tabs(["🏀 NBA", "🏒 NHL"])
 
 with nba_tab:
     st.subheader("Top Candidate Legs Today")
