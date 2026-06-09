@@ -403,6 +403,42 @@ st.markdown(
     /* =========================
        MOBILE RESPONSIVE UPGRADES
        ========================= */
+
+
+    /* Parlay math/readability fixes: dark blocks should always have bright text. */
+    .parlay-math-card {
+        background: #0f172a !important;
+        color: #ffffff !important;
+        border: 1px solid rgba(148,163,184,0.35) !important;
+        border-radius: 14px !important;
+        padding: 13px 15px !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
+        font-size: 14px !important;
+        line-height: 1.45 !important;
+        overflow-x: auto !important;
+        box-shadow: 0 8px 22px rgba(15,23,42,0.14) !important;
+    }
+
+    .parlay-math-card,
+    .parlay-math-card * {
+        color: #ffffff !important;
+    }
+
+    div[data-testid="stCodeBlock"],
+    div[data-testid="stCodeBlock"] *,
+    pre,
+    pre *,
+    code,
+    code * {
+        color: #ffffff !important;
+    }
+
+    div[data-testid="stCodeBlock"] pre,
+    pre {
+        background: #0f172a !important;
+        border-radius: 14px !important;
+    }
+
     @media (max-width: 900px) {
         .block-container {
             padding-top: 0.75rem !important;
@@ -2982,6 +3018,53 @@ def _trend_text(last5: Any, last10: Any, season: Any) -> str:
     return "Recent form is close to season baseline."
 
 
+
+def infer_cached_matchup_adjustment(leg: Dict[str, Any]) -> str:
+    """Return a transparent matchup note for cached odds rows.
+
+    Cached odds rows sometimes do not include the full model_factors payload, but they
+    usually still include sport/market/opponent. Use the same lightweight matchup maps
+    already used elsewhere in the app so the explanation area does not show a dead
+    "matchup unavailable" message.
+    """
+    market = str(leg.get("market") or "").upper()
+    opponent = str(leg.get("opponent") or "").upper().strip()
+    sport = str(leg.get("sport") or leg.get("league") or "").upper().strip()
+
+    if not opponent or opponent in {"NONE", "NAN", "—", ""}:
+        return "Neutral matchup adjustment; opponent was not saved on this cached odds row."
+
+    try:
+        if sport == "NHL" or market in {"SHOTS", "GOALS", "POINTS"}:
+            factor = nhl_defense_factor(opponent, market)
+        elif market == "3PT":
+            factor = load_nba_defense_factor().get(opponent, 1.0)
+        else:
+            factor = nba_points_defense_factor(opponent)
+        return f"{_factor_pct_text(factor)} versus {opponent}"
+    except Exception:
+        return f"Neutral matchup adjustment versus {opponent}"
+
+
+def infer_cached_volume_adjustment(leg: Dict[str, Any]) -> str:
+    """Give a useful volume/edge note for cached odds rows without inventing stats."""
+    projected = leg.get("expected_stat")
+    line = leg.get("line")
+    target = sportsbook_line_to_target(line) if line is not None else None
+    try:
+        if projected is not None and target is not None:
+            edge = float(projected) - float(target)
+            if edge >= 1.0:
+                return f"Strong projection cushion of {edge:+.2f} above target."
+            if edge >= 0.35:
+                return f"Moderate projection cushion of {edge:+.2f} above target."
+            if edge >= 0:
+                return f"Thin projection cushion of {edge:+.2f}; role/usage changes matter."
+            return f"Projection is {edge:+.2f} below target; price/model probability is carrying the read."
+    except Exception:
+        pass
+    return "Volume detail not saved; using projected stat, line, odds, and model probability instead."
+
 def infer_model_factors_from_leg(leg: Dict[str, Any]) -> Dict[str, Any]:
     """Build an explanation object even when the saved odds row did not include full model_factors.
 
@@ -3057,8 +3140,8 @@ def infer_model_factors_from_leg(leg: Dict[str, Any]) -> Dict[str, Any]:
         "expected_toi": None,
         "stat_per_min": None,
         "opportunity_projection": projected,
-        "opponent_adjustment": "Unavailable from cached odds row",
-        "volume_adjustment": "Unavailable from cached odds row",
+        "opponent_adjustment": infer_cached_matchup_adjustment(leg),
+        "volume_adjustment": infer_cached_volume_adjustment(leg),
         "explanation_summary": "; ".join(parts) if parts else probability_note,
         "data_note": "Full game-log factor details were not saved with this cached odds row, so this explanation uses the available model output, line, odds, implied probability, and projection edge.",
     }
@@ -3230,7 +3313,10 @@ def render_parlay_probability_explanation(p: Dict[str, Any]):
         if legs:
             probs = [float(leg.get("model_prob", 0) or 0) for leg in legs]
             math_line = " × ".join([f"{p0:.1f}%" for p0 in probs])
-            st.code(f"{math_line} = {raw_pct}% raw hit probability")
+            st.markdown(
+                f'<div class="parlay-math-card">{math_line} = {raw_pct}% raw hit probability</div>',
+                unsafe_allow_html=True,
+            )
 
         st.markdown("**What is helping this parlay most:**")
         helpers = []
@@ -5869,16 +5955,26 @@ def render_daily_odds_snapshot_controls() -> None:
 
     c1, c2 = st.columns([1, 3])
     with c1:
+        refresh_password = st.text_input(
+            "Refresh password",
+            type="password",
+            key="refresh_daily_odds_password",
+            placeholder="Enter password",
+            help="Required so shared users cannot burn API credits.",
+        )
         if st.button("Refresh Today's Odds", key="refresh_daily_odds_snapshot", help="Uses API credits intentionally, then saves a fresh daily snapshot."):
-            removed = clear_todays_odds_snapshot()
-            st.session_state["odds_force_refresh_until"] = time.time() + ODDS_FORCE_REFRESH_SECONDS
-            try:
-                st.cache_data.clear()
-            except Exception:
-                pass
-            st.success(f"Today's odds snapshot was reset ({removed} cached responses cleared). The next odds load will pull fresh data and save it for the day.")
+            if refresh_password == "Duncan":
+                removed = clear_todays_odds_snapshot()
+                st.session_state["odds_force_refresh_until"] = time.time() + ODDS_FORCE_REFRESH_SECONDS
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.success(f"Today's odds snapshot was reset ({removed} cached responses cleared). The next odds load will pull fresh data and save it for the day.")
+            else:
+                st.error("Incorrect refresh password. Odds were not refreshed and no API credits were intentionally used.")
     with c2:
-        st.caption("Leave this alone for normal use. Use it only when you want fresh lines after injuries/news or when odds changed.")
+        st.caption("Leave this alone for normal use. Refreshing is password protected so shared users cannot run through your API credits. Use it only after injuries/news or when odds changed.")
 
 # =========================
 # UI
