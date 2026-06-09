@@ -169,7 +169,7 @@ ODDS_FORCE_REFRESH_SECONDS = 180                    # manual refresh window; use
 # PAGE / STYLE
 # =========================
 
-st.set_page_config(page_title="NBA + NHL Prop Parlay Engine", layout="wide")
+st.set_page_config(page_title="NBA + NHL + MLB Prop Parlay Engine", layout="wide")
 
 st.markdown(
     """
@@ -1697,18 +1697,35 @@ def _save_odds_response(url: str, params: Dict[str, Any], data: Any, meta: Dict[
 
 
 def odds_api_get(url: str, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-    # 1) Daily local disk cache first. This is the main quota saver.
-    # Manual refresh intentionally bypasses it for a short window.
-    if not _odds_force_refresh_active():
-        cached_data, cached_meta = _get_cached_odds_response(url, params, allow_stale=False)
-        if cached_meta is not None:
-            return cached_data, cached_meta
+    """Quota-safe Odds API getter.
 
-    meta = {"ok": False, "status_code": None, "error": None, "cache_hit": False, "force_refresh": _odds_force_refresh_active()}
+    IMPORTANT: This function will NOT spend The Odds API credits during normal app use.
+    It only calls the live API during the short password-protected refresh window created by
+    the Refresh Today's Odds button. All regular buttons use today's saved snapshot or stale
+    cached data if available.
+    """
+    cached_data, cached_meta = _get_cached_odds_response(url, params, allow_stale=True)
+
+    # Normal/shared use: never call The Odds API unless the password-protected refresh is active.
+    if not _odds_force_refresh_active():
+        if cached_meta is not None:
+            cached_meta["api_locked"] = True
+            cached_meta["api_call_blocked"] = False
+            return cached_data, cached_meta
+        return None, {
+            "ok": False,
+            "status_code": None,
+            "error": "No cached odds snapshot found for this request. Use the password-protected Refresh Today's Odds button to load odds.",
+            "cache_hit": False,
+            "api_locked": True,
+            "api_call_blocked": True,
+            "force_refresh": False,
+        }
+
+    meta = {"ok": False, "status_code": None, "error": None, "cache_hit": False, "force_refresh": True, "api_locked": False}
     try:
         resp = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         meta["status_code"] = resp.status_code
-        # Helpful quota headers when The Odds API provides them.
         meta["requests_remaining"] = resp.headers.get("x-requests-remaining")
         meta["requests_used"] = resp.headers.get("x-requests-used")
         meta["requests_last"] = resp.headers.get("x-requests-last")
@@ -1718,13 +1735,10 @@ def odds_api_get(url: str, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]
                 meta["error"] = resp.json()
             except Exception:
                 meta["error"] = resp.text[:500]
-
-            # 2) If quota is exhausted or the endpoint errors, use last good cached data.
-            stale_data, stale_meta = _get_cached_odds_response(url, params, allow_stale=True)
-            if stale_meta is not None:
-                stale_meta["served_after_api_error"] = True
-                stale_meta["api_error"] = meta.get("error")
-                return stale_data, stale_meta
+            if cached_meta is not None:
+                cached_meta["served_after_api_error"] = True
+                cached_meta["api_error"] = meta.get("error")
+                return cached_data, cached_meta
             return None, meta
 
         data = resp.json()
@@ -1733,11 +1747,10 @@ def odds_api_get(url: str, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]
         return data, meta
     except Exception as e:
         meta["error"] = str(e)
-        stale_data, stale_meta = _get_cached_odds_response(url, params, allow_stale=True)
-        if stale_meta is not None:
-            stale_meta["served_after_api_error"] = True
-            stale_meta["api_error"] = meta.get("error")
-            return stale_data, stale_meta
+        if cached_meta is not None:
+            cached_meta["served_after_api_error"] = True
+            cached_meta["api_error"] = meta.get("error")
+            return cached_data, cached_meta
         return None, meta
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -6079,7 +6092,7 @@ def render_daily_odds_snapshot_controls() -> None:
     status_sub = (
         f"{summary.get('today_count', 0)} cached odds responses today • Latest pull {_format_cache_age(latest_age)}"
         if summary.get("today_count", 0)
-        else "First odds lookup today will create the daily snapshot automatically."
+        else "Use the password-protected refresh button to create or update today's snapshot."
     )
 
     st.markdown(
@@ -6088,7 +6101,7 @@ def render_daily_odds_snapshot_controls() -> None:
             <div class="quick-card-title">Daily Odds Snapshot</div>
             <div class="quick-card-main">{status_text}</div>
             <div class="quick-card-sub">{status_sub}</div>
-            <div class="quick-card-sub">Mode: one successful pull per unique odds request per day. Buttons reuse saved data instead of burning credits.</div>
+            <div class="quick-card-sub">Mode: API locked during normal use. Buttons only read saved odds; the API key is used only after the refresh password is accepted.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -6111,7 +6124,7 @@ def render_daily_odds_snapshot_controls() -> None:
                     st.cache_data.clear()
                 except Exception:
                     pass
-                st.success(f"Today's odds snapshot was reset ({removed} cached responses cleared). The next odds load will pull fresh data and save it for the day.")
+                st.success(f"Today's odds snapshot was reset ({removed} cached responses cleared). The next odds load during this refresh window will pull fresh data and save it for the day.")
             else:
                 st.error("Incorrect refresh password. Odds were not refreshed and no API credits were intentionally used.")
     with c2:
@@ -6119,8 +6132,8 @@ def render_daily_odds_snapshot_controls() -> None:
 
 
 def get_cached_today_game_counts() -> Dict[str, int]:
-    """Read saved daily odds snapshots and count today's NBA/NHL games without spending API credits."""
-    counts = {"NBA": 0, "NHL": 0}
+    """Read saved daily odds snapshots and count today's NBA/NHL/MLB games without spending API credits."""
+    counts = {"NBA": 0, "NHL": 0, "MLB": 0}
     cache = _read_odds_cache()
     today = _odds_cache_day()
 
@@ -6142,6 +6155,8 @@ def get_cached_today_game_counts() -> Dict[str, int]:
             counts["NBA"] = max(counts["NBA"], len(data))
         elif "icehockey_nhl" in url:
             counts["NHL"] = max(counts["NHL"], len(data))
+        elif "baseball_mlb" in url:
+            counts["MLB"] = max(counts["MLB"], len(data))
 
     return counts
 
@@ -6151,10 +6166,10 @@ def render_home_status_bar() -> None:
     last_update = _format_cache_age(latest_age) if latest_age is not None else "No snapshot yet"
     today_count = int(summary.get("today_count", 0) or 0)
     cache_main = "Active" if today_count else "Waiting"
-    cache_sub = f"{today_count} saved pulls today" if today_count else "First pull creates snapshot"
+    cache_sub = f"{today_count} saved pulls today" if today_count else "Refresh creates snapshot"
     game_counts = get_cached_today_game_counts()
-    games_main = f"NBA {game_counts.get('NBA', 0)} • NHL {game_counts.get('NHL', 0)}"
-    if game_counts.get('NBA', 0) == 0 and game_counts.get('NHL', 0) == 0:
+    games_main = f"NBA {game_counts.get('NBA', 0)} • NHL {game_counts.get('NHL', 0)} • MLB {game_counts.get('MLB', 0)}"
+    if game_counts.get('NBA', 0) == 0 and game_counts.get('NHL', 0) == 0 and game_counts.get('MLB', 0) == 0:
         games_main = "Load odds to count"
 
     st.markdown(
@@ -6206,16 +6221,16 @@ st.markdown(
     """
     <div class="app-hero">
         <div class="hero-kicker">Live Props • Model Edge • Parlay Builder</div>
-        <div class="app-title">NBA + NHL Prop Parlay Engine</div>
+        <div class="app-title">NBA + NHL + MLB Prop Parlay Engine</div>
         <div class="app-subtitle">
             A cleaner prop analytics dashboard for finding the strongest player legs, comparing sportsbook odds,
-            and building smarter parlays from model probability, expected value, and payout.
+            and building smarter parlays across NBA, NHL, and MLB from model probability, expected value, and payout.
         </div>
         <div class="hero-badges">
             <span class="hero-badge">DraftKings / FanDuel odds layer</span>
             <span class="hero-badge">Cached API pulls</span>
             <span class="hero-badge">Best legs + 3 parlay styles</span>
-            <span class="hero-badge">NBA + NHL markets</span>
+            <span class="hero-badge">NBA + NHL + MLB markets</span>
         </div>
     </div>
     <div class="logo-strip">
@@ -7570,12 +7585,12 @@ with mlb_tab:
         render_selected_parlays(selected)
 
     st.markdown("---")
-    st.subheader("Manual Parlay Builder")
-    st.caption("Choose MLB hitters and evaluate hits/home run targets. This uses MLB Stats game logs when available and falls back to sportsbook-calibrated probability.")
+    st.subheader("Create Your Own Parlay")
+    st.caption("Build a custom MLB parlay for hits and home runs. Choose MLB hitters and evaluate hits/home run targets. This uses MLB Stats game logs when available and falls back to sportsbook-calibrated probability.")
 
     mlb_player_names = get_mlb_prop_player_names()
     if not mlb_player_names:
-        st.warning("No MLB player list is available yet. Load today's MLB odds first or check your API/cache source.")
+        st.warning("No MLB player list is available yet. Use the password-protected Refresh Today's Odds button to load today's MLB odds snapshot, then come back here.")
     else:
         mlb_num_players = st.number_input("Number of MLB Players", min_value=1, max_value=5, value=2, step=1, key="mlb_num_players")
         mlb_inputs = []
