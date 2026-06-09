@@ -338,6 +338,89 @@ st.markdown(
         line-height: 1.35;
     }
 
+
+    .daily-dashboard-bar {
+        display: flex;
+        align-items: stretch;
+        justify-content: space-between;
+        gap: 0;
+        margin: 0 0 18px 0;
+        padding: 10px;
+        border-radius: 24px;
+        background: rgba(255,255,255,0.88);
+        border: 1px solid rgba(203,213,225,0.95);
+        box-shadow: 0 16px 38px rgba(15,23,42,0.08);
+        overflow: hidden;
+    }
+
+    .status-pill {
+        flex: 1 1 0;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        padding: 13px 16px;
+        border-right: 1px solid rgba(226,232,240,0.95);
+        color: #0f172a;
+    }
+
+    .status-pill:last-child { border-right: none; }
+
+    .status-icon {
+        width: 38px;
+        height: 38px;
+        flex: 0 0 38px;
+        border-radius: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 19px;
+        background: linear-gradient(135deg, #eff6ff, #dbeafe);
+        border: 1px solid rgba(191,219,254,0.9);
+    }
+
+    .status-label {
+        font-size: 11px;
+        line-height: 1;
+        color: #64748b;
+        font-weight: 850;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+        margin-bottom: 6px;
+        white-space: nowrap;
+    }
+
+    .status-main {
+        font-size: 15px;
+        line-height: 1.2;
+        color: #0f172a;
+        font-weight: 850;
+        letter-spacing: -0.02em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .status-sub {
+        font-size: 12px;
+        color: #475569;
+        margin-top: 3px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .status-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #16a34a;
+        box-shadow: 0 0 0 4px rgba(22,163,74,0.12);
+        margin-left: 6px;
+        vertical-align: middle;
+    }
+
     .metric-card {
         border: 1px solid rgba(226,232,240,0.95);
         border-radius: 18px;
@@ -524,6 +607,45 @@ st.markdown(
             padding: 14px 15px;
             min-height: auto;
             margin-bottom: 8px;
+        }
+
+        .daily-dashboard-bar {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            padding: 8px;
+            border-radius: 20px;
+            margin-bottom: 14px;
+        }
+
+        .status-pill {
+            border-right: none;
+            border-radius: 16px;
+            background: rgba(248,250,252,0.94);
+            border: 1px solid rgba(226,232,240,0.95);
+            padding: 11px 10px;
+            gap: 8px;
+        }
+
+        .status-icon {
+            width: 32px;
+            height: 32px;
+            flex-basis: 32px;
+            border-radius: 12px;
+            font-size: 16px;
+        }
+
+        .status-label {
+            font-size: 9px;
+            margin-bottom: 5px;
+        }
+
+        .status-main {
+            font-size: 13px;
+        }
+
+        .status-sub {
+            font-size: 10px;
         }
 
         .quick-card-main {
@@ -5976,6 +6098,55 @@ def render_daily_odds_snapshot_controls() -> None:
     with c2:
         st.caption("Leave this alone for normal use. Refreshing is password protected so shared users cannot run through your API credits. Use it only after injuries/news or when odds changed.")
 
+def render_home_status_bar() -> None:
+    summary = get_odds_cache_summary()
+    latest_age = summary.get("latest_today_age")
+    last_update = _format_cache_age(latest_age) if latest_age is not None else "No snapshot yet"
+    today_count = int(summary.get("today_count", 0) or 0)
+    cache_main = "Active" if today_count else "Waiting"
+    cache_sub = f"{today_count} saved pulls today" if today_count else "First pull creates snapshot"
+
+    st.markdown(
+        f'''
+        <div class="daily-dashboard-bar">
+            <div class="status-pill">
+                <div class="status-icon">📅</div>
+                <div>
+                    <div class="status-label">Odds Updated</div>
+                    <div class="status-main">{last_update}</div>
+                    <div class="status-sub">Daily snapshot mode</div>
+                </div>
+            </div>
+            <div class="status-pill">
+                <div class="status-icon">💾</div>
+                <div>
+                    <div class="status-label">Cache Status</div>
+                    <div class="status-main">{cache_main}<span class="status-dot"></span></div>
+                    <div class="status-sub">{cache_sub}</div>
+                </div>
+            </div>
+            <div class="status-pill">
+                <div class="status-icon">🏀</div>
+                <div>
+                    <div class="status-label">Markets</div>
+                    <div class="status-main">NBA + NHL</div>
+                    <div class="status-sub">Points, 3PT, shots, goals</div>
+                </div>
+            </div>
+            <div class="status-pill">
+                <div class="status-icon">🤖</div>
+                <div>
+                    <div class="status-label">Model</div>
+                    <div class="status-main">V2 Active</div>
+                    <div class="status-sub">Projection factors + parlay math</div>
+                </div>
+            </div>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+
 # =========================
 # UI
 # =========================
@@ -6034,23 +6205,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-landing_cols = st.columns(4)
-landing_cols[0].markdown(
-    '<div class="quick-card"><div class="quick-card-title">Odds Engine</div><div class="quick-card-main">Cached pulls</div><div class="quick-card-sub">Reuses saved responses to help protect API credits.</div></div>',
-    unsafe_allow_html=True,
-)
-landing_cols[1].markdown(
-    '<div class="quick-card"><div class="quick-card-title">Best Legs</div><div class="quick-card-main">Model ranked</div><div class="quick-card-sub">Balances hit rate, EV, payout, and fair odds.</div></div>',
-    unsafe_allow_html=True,
-)
-landing_cols[2].markdown(
-    '<div class="quick-card"><div class="quick-card-title">Parlays</div><div class="quick-card-main">3 styles</div><div class="quick-card-sub">Value, balanced, and best hit percentage builds.</div></div>',
-    unsafe_allow_html=True,
-)
-landing_cols[3].markdown(
-    '<div class="quick-card"><div class="quick-card-title">Markets</div><div class="quick-card-main">NBA + NHL</div><div class="quick-card-sub">Points, 3PT, shots, goals, and points props.</div></div>',
-    unsafe_allow_html=True,
-)
+render_home_status_bar()
 
 st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
 render_daily_odds_snapshot_controls()
