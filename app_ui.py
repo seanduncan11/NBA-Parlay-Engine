@@ -2982,6 +2982,88 @@ def _trend_text(last5: Any, last10: Any, season: Any) -> str:
     return "Recent form is close to season baseline."
 
 
+def infer_model_factors_from_leg(leg: Dict[str, Any]) -> Dict[str, Any]:
+    """Build an explanation object even when the saved odds row did not include full model_factors.
+
+    Some cached/fallback rows are created directly from sportsbook odds and only have
+    the core fields: model_prob, expected_stat, line, odds, market, team/opponent.
+    This function prevents the UI from showing an unhelpful unavailable message by
+    deriving a transparent explanation from the fields we do have. It does not invent
+    game-log stats; those stay marked unavailable.
+    """
+    if not isinstance(leg, dict):
+        return {}
+
+    existing = leg.get("model_factors")
+    if isinstance(existing, dict) and existing:
+        return existing
+
+    line = leg.get("line")
+    target = sportsbook_line_to_target(line) if line is not None else None
+    projected = leg.get("expected_stat")
+    prob = leg.get("model_prob")
+    odds = leg.get("book_over_odds")
+    implied = american_to_implied_prob(odds) if odds is not None else leg.get("implied_prob")
+
+    source = leg.get("line_source") or leg.get("book") or "cached odds source"
+    market = leg.get("market")
+    edge_vs_target = None
+    try:
+        if projected is not None and target is not None:
+            edge_vs_target = round(float(projected) - float(target), 2)
+    except Exception:
+        edge_vs_target = None
+
+    probability_note = "Model probability from the cached odds/model row."
+    try:
+        if prob is not None and implied is not None:
+            diff = float(prob) / 100 - float(implied)
+            if diff > 0.05:
+                probability_note = "Model probability is meaningfully above the book's implied probability."
+            elif diff < -0.03:
+                probability_note = "Model probability is below/near the book's implied probability; value may be thin."
+            else:
+                probability_note = "Model probability is close to the book's implied probability."
+    except Exception:
+        pass
+
+    parts = []
+    if projected is not None and target is not None:
+        parts.append(f"Projected {projected} vs target {target}")
+    if edge_vs_target is not None:
+        parts.append(f"edge {edge_vs_target:+.2f}")
+    if implied is not None:
+        try:
+            parts.append(f"book implied {float(implied) * 100:.1f}%")
+        except Exception:
+            pass
+
+    return {
+        "model_prob": prob,
+        "projected_stat": projected,
+        "sportsbook_line": line,
+        "target_needed": target,
+        "market_implied_prob": implied,
+        "book_odds": odds,
+        "market": market,
+        "team": leg.get("team"),
+        "opponent": leg.get("opponent"),
+        "line_source": source,
+        "projection_edge": edge_vs_target,
+        "season_avg": None,
+        "last10_avg": None,
+        "last5_avg": None,
+        "expected_minutes": None,
+        "expected_toi": None,
+        "stat_per_min": None,
+        "opportunity_projection": projected,
+        "opponent_adjustment": "Unavailable from cached odds row",
+        "volume_adjustment": "Unavailable from cached odds row",
+        "explanation_summary": "; ".join(parts) if parts else probability_note,
+        "data_note": "Full game-log factor details were not saved with this cached odds row, so this explanation uses the available model output, line, odds, implied probability, and projection edge.",
+    }
+
+
 def _factor_rows_for_leg(leg: Dict[str, Any]) -> List[Dict[str, Any]]:
     factors = leg.get("model_factors") if isinstance(leg.get("model_factors"), dict) else {}
     projected = factors.get("projected_stat", leg.get("expected_stat"))
@@ -3020,6 +3102,8 @@ def _factor_rows_for_leg(leg: Dict[str, Any]) -> List[Dict[str, Any]]:
     add("Volume adjustment", factors.get("volume_adjustment"), "Shot/attempt volume adjustment when available.")
     add("Market implied probability", _fmt_pct(implied) if implied is not None else None, "Book's implied probability, used as a reality check.")
     add("Book odds", safe_odds_display(leg.get("book_over_odds")), "Available payout for the model probability.")
+    add("Data source", factors.get("line_source"), "Shows whether this came from model v2, sportsbook API, or daily cache.")
+    add("Data note", factors.get("data_note"), "Explains when full season/L5/L10 opportunity details were unavailable and estimated from saved outputs.")
     add("EV", leg.get("ev"), "Positive EV means model probability is better than the price implies.")
     return rows
 
@@ -3049,10 +3133,9 @@ def compact_factor_text(factors: Any) -> str:
 def render_leg_model_explanation(leg: Dict[str, Any], index: Optional[int] = None):
     title_prefix = f"Leg {index}: " if index is not None else ""
     title = f"{title_prefix}{leg.get('leg_label', 'Selected leg')}"
-    factors = leg.get("model_factors") if isinstance(leg.get("model_factors"), dict) else {}
-
+    factors = infer_model_factors_from_leg(leg)
     if not factors:
-        st.caption(f"{title} — detailed model factors unavailable for this odds source/cache entry.")
+        st.caption(f"{title} — basic probability inputs unavailable for this entry.")
         return
 
     with st.expander(f"Why this probability? — {title}", expanded=False):
@@ -3104,7 +3187,7 @@ def render_parlay_probability_explanation(p: Dict[str, Any]):
         for i, leg in enumerate(legs, start=1):
             prob = float(leg.get("model_prob", 0) or 0)
             raw_prob *= prob / 100
-            factors = leg.get("model_factors") if isinstance(leg.get("model_factors"), dict) else {}
+            factors = infer_model_factors_from_leg(leg)
             projected = factors.get("projected_stat", leg.get("expected_stat"))
             line = factors.get("sportsbook_line", leg.get("line"))
             target = factors.get("target_needed", sportsbook_line_to_target(line) if line is not None else None)
@@ -3152,7 +3235,7 @@ def render_parlay_probability_explanation(p: Dict[str, Any]):
         st.markdown("**What is helping this parlay most:**")
         helpers = []
         for leg in legs:
-            factors = leg.get("model_factors") if isinstance(leg.get("model_factors"), dict) else {}
+            factors = infer_model_factors_from_leg(leg)
             if factors:
                 helpers.append(f"✓ {leg.get('leg_label')}: {compact_factor_text(factors)}")
         if helpers:
@@ -3216,7 +3299,7 @@ def render_selected_parlays(selected_parlays: Dict[str, Dict[str, Any]]):
                     "Projected": leg.get("expected_stat"),
                     "Line": leg.get("line"),
                     "EV": leg["ev"],
-                    "Top Reason": compact_factor_text(leg.get("model_factors")),
+                    "Top Reason": compact_factor_text(infer_model_factors_from_leg(leg)),
                 }
                 for leg in p["legs"]
             ]
