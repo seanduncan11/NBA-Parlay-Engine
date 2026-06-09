@@ -24,6 +24,8 @@ API_KEY = "9f56e4fb5f6ff37b0a1bac6ea7900e78"
 NBA_SEASON = "2025-26"
 NBA_SPORT_KEY = "basketball_nba"
 NHL_SPORT_KEY = "icehockey_nhl"
+MLB_SPORT_KEY = "baseball_mlb"
+MLB_SEASON = "2026"
 
 PREFERRED_BOOKMAKERS = "draftkings,fanduel"
 REQUEST_TIMEOUT = 20
@@ -38,6 +40,9 @@ NBA_THREES_MARKET_KEYS = ["player_threes", "player_threes_alternate"]
 NHL_POINTS_MARKET_KEYS = ["player_points", "player_points_alternate"]
 NHL_SHOTS_MARKET_KEYS = ["player_shots_on_goal", "player_shots_on_goal_alternate"]
 NHL_GOALS_MARKET_KEYS = ["player_goals", "player_goals_alternate"]
+
+MLB_HITS_MARKET_KEYS = ["batter_hits", "batter_hits_alternate"]
+MLB_HR_MARKET_KEYS = ["batter_home_runs", "batter_home_runs_alternate"]
 
 NBA_TEAM_NAME_MAP = {
     "ATL": "Atlanta Hawks",
@@ -3454,15 +3459,6 @@ def render_parlay_probability_explanation(p: Dict[str, Any]):
         if summary_rows:
             st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-        st.markdown("**Parlay math:**")
-        if legs:
-            probs = [float(leg.get("model_prob", 0) or 0) for leg in legs]
-            math_line = " × ".join([f"{p0:.1f}%" for p0 in probs])
-            st.markdown(
-                f'<div class="parlay-math-card" style="background:linear-gradient(135deg,#020617,#0f172a) !important; color:#ffffff !important;"><span style="color:#ffffff !important;">{math_line} = {raw_pct}% raw hit probability</span></div>',
-                unsafe_allow_html=True,
-            )
-
         st.markdown("**What is helping this parlay most:**")
         helpers = []
         for leg in legs:
@@ -6788,7 +6784,345 @@ def get_manual_nba_player_props(
 
     return props
 
-nba_tab, nhl_tab = st.tabs(["🏀 NBA", "🏒 NHL"])
+
+
+# =========================
+# MLB ENGINE ADD-ON
+# =========================
+# Adds MLB hits + home run props while keeping NBA/NHL logic untouched.
+
+MLB_TEAM_IDS = {
+    "Arizona Diamondbacks": 109, "Atlanta Braves": 144, "Baltimore Orioles": 110, "Boston Red Sox": 111,
+    "Chicago Cubs": 112, "Chicago White Sox": 145, "Cincinnati Reds": 113, "Cleveland Guardians": 114,
+    "Colorado Rockies": 115, "Detroit Tigers": 116, "Houston Astros": 117, "Kansas City Royals": 118,
+    "Los Angeles Angels": 108, "Los Angeles Dodgers": 119, "Miami Marlins": 146, "Milwaukee Brewers": 158,
+    "Minnesota Twins": 142, "New York Mets": 121, "New York Yankees": 147, "Athletics": 133,
+    "Oakland Athletics": 133, "Philadelphia Phillies": 143, "Pittsburgh Pirates": 134, "San Diego Padres": 135,
+    "San Francisco Giants": 137, "Seattle Mariners": 136, "St. Louis Cardinals": 138, "St Louis Cardinals": 138,
+    "Tampa Bay Rays": 139, "Texas Rangers": 140, "Toronto Blue Jays": 141, "Washington Nationals": 120,
+}
+
+MLB_TEAM_ABBREV = {
+    "Arizona Diamondbacks": "ARI", "Atlanta Braves": "ATL", "Baltimore Orioles": "BAL", "Boston Red Sox": "BOS",
+    "Chicago Cubs": "CHC", "Chicago White Sox": "CWS", "Cincinnati Reds": "CIN", "Cleveland Guardians": "CLE",
+    "Colorado Rockies": "COL", "Detroit Tigers": "DET", "Houston Astros": "HOU", "Kansas City Royals": "KC",
+    "Los Angeles Angels": "LAA", "Los Angeles Dodgers": "LAD", "Miami Marlins": "MIA", "Milwaukee Brewers": "MIL",
+    "Minnesota Twins": "MIN", "New York Mets": "NYM", "New York Yankees": "NYY", "Athletics": "ATH",
+    "Oakland Athletics": "OAK", "Philadelphia Phillies": "PHI", "Pittsburgh Pirates": "PIT", "San Diego Padres": "SD",
+    "San Francisco Giants": "SF", "Seattle Mariners": "SEA", "St. Louis Cardinals": "STL", "St Louis Cardinals": "STL",
+    "Tampa Bay Rays": "TB", "Texas Rangers": "TEX", "Toronto Blue Jays": "TOR", "Washington Nationals": "WSH",
+}
+
+def _mlb_abbrev(team_name: Any) -> str:
+    name = str(team_name or "").strip()
+    if name in MLB_TEAM_ABBREV:
+        return MLB_TEAM_ABBREV[name]
+    # Handle occasional sponsor/location spelling differences.
+    norm = normalize_team_text(name)
+    for full, abbr in MLB_TEAM_ABBREV.items():
+        if normalize_team_text(full) == norm or norm in normalize_team_text(full) or normalize_team_text(full) in norm:
+            return abbr
+    return name[:3].upper() if name else ""
+
+# Final override: include MLB labels in all leg labels.
+def _label_suffix(market_label: str) -> str:
+    return {
+        "PTS": "points",
+        "3PT": "3PT",
+        "POINTS": "points",
+        "SHOTS": "shots",
+        "GOALS": "goals",
+        "HITS": "hits",
+        "HR": "home runs",
+    }.get(market_label, str(market_label).lower())
+
+# Final override: team abbreviations for NBA/NHL/MLB button boards.
+def _best_button_team_abbrevs(event: Dict[str, Any], sport: str) -> Tuple[str, str]:
+    if sport == "NBA":
+        reverse = _reverse_nba_team_map()
+        home = _reverse_lookup_first_match(event.get("home_team", ""), reverse)
+        away = _reverse_lookup_first_match(event.get("away_team", ""), reverse)
+    elif sport == "NHL":
+        reverse = _reverse_nhl_team_map()
+        home = _reverse_lookup_first_match(event.get("home_team", ""), reverse)
+        away = _reverse_lookup_first_match(event.get("away_team", ""), reverse)
+    else:
+        home = _mlb_abbrev(event.get("home_team", ""))
+        away = _mlb_abbrev(event.get("away_team", ""))
+    return home, away
+
+# Final override: allow DraftKings/FanDuel public fallback parsing to recognize MLB names too.
+def _final_market_from_blob(blob: str, sport: str) -> Optional[Tuple[str, str]]:
+    raw = str(blob or "").lower()
+    compact = normalize_team_text(blob)
+
+    if sport == "NBA":
+        if any(x in raw for x in ["3-pointers made", "3 pointers made", "three pointers made", "threes made"]):
+            return "3PT", "player_threes"
+        if ("player" in raw and "point" in raw) or raw.strip() in {"points", "player points"}:
+            return "PTS", "player_points"
+        if "pointsscored" in compact or "playerpoints" in compact:
+            return "PTS", "player_points"
+        return None
+
+    if sport == "MLB":
+        if "home run" in raw or "homer" in raw or "batterhomeruns" in compact or "homeruns" in compact:
+            return "HR", "batter_home_runs"
+        if "hit" in raw or "batterhits" in compact:
+            return "HITS", "batter_hits"
+        return None
+
+    # NHL
+    if "shots on goal" in raw or "shot on goal" in raw or "sog" in raw:
+        return "SHOTS", "player_shots_on_goal"
+    if "player shots" in raw and "goal" in raw:
+        return "SHOTS", "player_shots_on_goal"
+    if "player points" in raw or "points" == raw.strip() or "1+ points" in raw:
+        return "POINTS", "player_points"
+    if "goals" in raw or "goal scorer" in raw or "anytime goal" in raw:
+        return "GOALS", "player_goals"
+    if "playertorecord" in compact and "shotsongoal" in compact:
+        return "SHOTS", "player_shots_on_goal"
+    if "playerpoints" in compact:
+        return "POINTS", "player_points"
+    return None
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def get_mlb_all_player_pool() -> List[Dict[str, Any]]:
+    players_out: List[Dict[str, Any]] = []
+    seen = set()
+    for team_name, team_id in MLB_TEAM_IDS.items():
+        # Skip duplicate Oakland/Athletics ids.
+        if team_id in seen and team_name in {"Oakland Athletics"}:
+            continue
+        url = f"https://statsapi.mlb.com/api/v1/teams/{team_id}/roster"
+        try:
+            resp = requests.get(url, params={"rosterType": "active"}, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            if not resp.ok:
+                continue
+            data = resp.json()
+            for item in data.get("roster", []) or []:
+                person = item.get("person", {}) or {}
+                pid = person.get("id")
+                name = person.get("fullName")
+                pos = (item.get("position", {}) or {}).get("abbreviation", "")
+                # Include hitters; pitchers can still be skipped for batter props.
+                if pid and name and pid not in seen:
+                    seen.add(pid)
+                    players_out.append({"id": int(pid), "full_name": name, "team": MLB_TEAM_ABBREV.get(team_name, team_name[:3].upper()), "position": pos})
+        except Exception:
+            continue
+    return players_out
+
+def get_mlb_player_id(name: str) -> Optional[int]:
+    target = normalize_name(name)
+    pool = get_mlb_all_player_pool()
+    for p in pool:
+        if normalize_name(p.get("full_name")) == target:
+            return int(p["id"])
+    for p in pool:
+        if player_name_matches(name, p.get("full_name")):
+            return int(p["id"])
+    return None
+
+def get_mlb_player_team(name: str) -> str:
+    target = normalize_name(name)
+    for p in get_mlb_all_player_pool():
+        if normalize_name(p.get("full_name")) == target or player_name_matches(name, p.get("full_name")):
+            return str(p.get("team") or "")
+    return ""
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def fetch_mlb_recent_games(pid: int, season: str = MLB_SEASON, num_games: int = 60) -> pd.DataFrame:
+    url = f"https://statsapi.mlb.com/api/v1/people/{pid}/stats"
+    params = {"stats": "gameLog", "group": "hitting", "season": season}
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        if not resp.ok:
+            return pd.DataFrame()
+        data = resp.json()
+        splits = []
+        for block in data.get("stats", []) or []:
+            splits.extend(block.get("splits", []) or [])
+        rows = []
+        for s in splits:
+            stat = s.get("stat", {}) or {}
+            try:
+                rows.append({
+                    "GAME_DATE": s.get("date"),
+                    "HITS": float(stat.get("hits", 0) or 0),
+                    "HR": float(stat.get("homeRuns", 0) or 0),
+                    "AB": float(stat.get("atBats", 0) or 0),
+                    "PA": float(stat.get("plateAppearances", 0) or 0),
+                })
+            except Exception:
+                continue
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
+        df = df.sort_values("GAME_DATE", ascending=False).head(num_games).reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def build_mlb_model_v2_projection(games_df: pd.DataFrame, market: str, opponent: str, target: int, line: Optional[float] = None, odds: Optional[int] = None) -> Tuple[float, float, Dict[str, Any]]:
+    stat = "HR" if market == "HR" else "HITS"
+    if games_df.empty or stat not in games_df.columns:
+        implied = american_to_implied_prob(odds) if odds is not None else None
+        prob = round((implied or 0.50) * 100, 2)
+        expected = estimate_expected_from_probability(line, prob) if line is not None else float(target)
+        return prob, float(expected or target), {
+            "model_prob": prob,
+            "projected_stat": round(float(expected or target), 2),
+            "sportsbook_line": line,
+            "target_needed": target,
+            "market_implied_prob": implied,
+            "line_source": "MLB sportsbook baseline",
+            "data_note": "MLB game-log detail unavailable; probability anchored to sportsbook price.",
+        }
+
+    vals = pd.to_numeric(games_df[stat], errors="coerce").fillna(0)
+    season_avg = float(vals.mean())
+    last10_avg = float(vals.head(10).mean()) if len(vals) >= 10 else season_avg
+    last5_avg = float(vals.head(5).mean()) if len(vals) >= 5 else last10_avg
+
+    # Opportunity: plate appearances. If PA missing, assume normal regular role.
+    pa_vals = pd.to_numeric(games_df.get("PA", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    season_pa = float(pa_vals[pa_vals > 0].mean()) if not pa_vals.empty and (pa_vals > 0).any() else 4.1
+    recent_pa = float(pa_vals.head(10)[pa_vals.head(10) > 0].mean()) if not pa_vals.empty and (pa_vals.head(10) > 0).any() else season_pa
+    opportunity_factor = max(0.82, min(1.18, recent_pa / season_pa if season_pa else 1.0))
+
+    # HRs are much noisier than hits, so do not overreact to last 5.
+    if stat == "HR":
+        blended = (season_avg * 0.60) + (last10_avg * 0.28) + (last5_avg * 0.12)
+    else:
+        blended = (season_avg * 0.45) + (last10_avg * 0.35) + (last5_avg * 0.20)
+    projected = max(0.01, blended * opportunity_factor)
+
+    poisson_prob, _ = calculate_poisson_probability(projected, 1.0, int(target))
+    implied = american_to_implied_prob(odds) if odds is not None else None
+    if implied is not None:
+        # Calibrate to the market so the model does not create fantasy probabilities on volatile MLB props.
+        model_prob = round((poisson_prob * 0.68) + (implied * 100 * 0.32), 2)
+    else:
+        model_prob = round(poisson_prob, 2)
+    model_prob = max(2.0, min(92.0, model_prob))
+
+    factors = {
+        "model_prob": model_prob,
+        "projected_stat": round(projected, 2),
+        "sportsbook_line": line,
+        "target_needed": target,
+        "season_avg": round(season_avg, 3),
+        "last10_avg": round(last10_avg, 3),
+        "last5_avg": round(last5_avg, 3),
+        "expected_plate_appearances": round(recent_pa, 2),
+        "expected_minutes": None,
+        "expected_toi": None,
+        "stat_per_min": None,
+        "opportunity_projection": round(projected, 2),
+        "opponent_adjustment": "Neutral until pitcher/park factors are added",
+        "volume_adjustment": f"Recent PA factor {opportunity_factor:.2f}x",
+        "market_implied_prob": implied,
+        "line_source": "MLB Model v2: season/L10/L5 + plate appearances + market calibration",
+        "data_note": "MLB model uses batting game logs and plate-appearance opportunity. Pitcher handedness, park, weather, and lineup slot can be added next for more accuracy.",
+    }
+    return model_prob, round(projected, 2), factors
+
+# Final override: MLB-aware enrichment while preserving NBA/NHL behavior.
+@st.cache_data(ttl=900, show_spinner=False)
+def enrich_best_leg_board(df: pd.DataFrame, sport: str, max_rows: int = 36) -> pd.DataFrame:
+    if df.empty:
+        return df
+    enriched_rows = []
+    defense_3pt = load_nba_defense_factor() if sport == "NBA" else {}
+
+    for row in df.head(max_rows).to_dict("records"):
+        try:
+            player_name = row.get("player")
+            line = row.get("line")
+            odds = row.get("book_over_odds")
+            market = row.get("market")
+            opponent = row.get("opponent") or ""
+            if player_name is None or line is None or odds is None:
+                enriched_rows.append(row); continue
+            target = sportsbook_line_to_target(line)
+            if target is None:
+                enriched_rows.append(row); continue
+
+            if sport == "NBA":
+                pid = get_nba_player_id(player_name)
+                if pid is None:
+                    enriched_rows.append(row); continue
+                try:
+                    row["team"] = get_nba_player_team(pid)
+                except Exception:
+                    pass
+                games_df = fetch_nba_recent_games(pid)
+                if games_df.empty:
+                    enriched_rows.append(row); continue
+                model_prob, expected_stat, model_factors = build_nba_model_v2_projection(games_df, market, opponent, target, line=line, odds=odds)
+
+            elif sport == "NHL":
+                pid = get_nhl_player_id(player_name)
+                if pid is None:
+                    enriched_rows.append(row); continue
+                team_lookup = get_nhl_player_team(player_name)
+                if team_lookup:
+                    row["team"] = team_lookup
+                games_df = fetch_nhl_recent_games(pid)
+                if games_df.empty:
+                    enriched_rows.append(row); continue
+                model_prob, expected_stat, model_factors = build_nhl_model_v2_projection(games_df, market, opponent, target, line=line, odds=odds)
+
+            elif sport == "MLB":
+                pid = get_mlb_player_id(player_name)
+                if pid is None:
+                    enriched_rows.append(row); continue
+                team_lookup = get_mlb_player_team(player_name)
+                if team_lookup:
+                    row["team"] = team_lookup
+                games_df = fetch_mlb_recent_games(pid)
+                if games_df.empty:
+                    enriched_rows.append(row); continue
+                model_prob, expected_stat, model_factors = build_mlb_model_v2_projection(games_df, market, opponent, target, line=line, odds=odds)
+            else:
+                enriched_rows.append(row); continue
+
+            implied_prob = american_to_implied_prob(odds)
+            ev = calculate_ev(model_prob, american_to_decimal(odds))
+            edge = round((model_prob / 100) - implied_prob, 4) if implied_prob is not None else None
+            row["expected_stat"] = round(float(expected_stat), 2)
+            row["model_prob"] = model_prob
+            row["fair_odds"] = probability_to_fair_american(model_prob)
+            row["ev"] = ev
+            row["edge"] = edge
+            row["implied_prob"] = round(implied_prob, 4) if implied_prob is not None else None
+            row["leg_score"] = score_best_leg_board(model_prob, odds)
+            row["line_source"] = model_factors.get("line_source", "Model v2") if isinstance(model_factors, dict) else "Model v2"
+            row["model_factors"] = model_factors
+            row["explanation"] = compact_factor_text(model_factors)
+            enriched_rows.append(row)
+        except Exception:
+            enriched_rows.append(row)
+    # Preserve rows beyond max_rows unchanged so candidate count does not shrink.
+    if len(df) > max_rows:
+        enriched_rows.extend(df.iloc[max_rows:].to_dict("records"))
+    return pd.DataFrame(enriched_rows)
+
+def get_mlb_prop_player_names() -> List[str]:
+    df = build_direct_candidate_board(
+        MLB_SPORT_KEY,
+        [("HITS", MLB_HITS_MARKET_KEYS), ("HR", MLB_HR_MARKET_KEYS)],
+        "MLB",
+    )
+    if not df.empty and "player" in df.columns:
+        return sorted(df["player"].dropna().drop_duplicates().tolist())
+    return sorted([p["full_name"] for p in get_mlb_all_player_pool()])
+
+
+nba_tab, nhl_tab, mlb_tab = st.tabs(["🏀 NBA", "🏒 NHL", "⚾ MLB"])
 
 with nba_tab:
     st.subheader("Top Candidate Legs Today")
@@ -7193,4 +7527,145 @@ with nhl_tab:
 
 
 
+
+
+with mlb_tab:
+    st.subheader("Top Candidate Legs Today")
+    st.caption("MLB add-on: model-ranked batter hits and home run props using sportsbook lines plus MLB game-log form/opportunity.")
+    if st.button("Find Top Candidate Legs Today", key="mlb_top_legs"):
+        progress_bar = st.progress(0, text="Starting MLB scan...")
+        status_text = st.empty()
+        candidate_df = build_ranked_best_leg_board(
+            MLB_SPORT_KEY,
+            [("HITS", MLB_HITS_MARKET_KEYS), ("HR", MLB_HR_MARKET_KEYS)],
+            "MLB",
+            progress_bar=progress_bar,
+            status_text=status_text,
+            top_n=20,
+            enrich_rows=36,
+        )
+        progress_bar.empty()
+        status_text.empty()
+        render_candidate_table(candidate_df)
+
+    st.markdown("---")
+    st.subheader("Best Parlays Today")
+    if st.button("Find Best Parlays Today", key="mlb_best_parlays", type="primary"):
+        progress_bar = st.progress(0, text="Starting MLB parlay engine...")
+        status_text = st.empty()
+        filtered_df = build_ranked_best_leg_board(
+            MLB_SPORT_KEY,
+            [("HITS", MLB_HITS_MARKET_KEYS), ("HR", MLB_HR_MARKET_KEYS)],
+            "MLB",
+            progress_bar=progress_bar,
+            status_text=status_text,
+            top_n=28,
+            enrich_rows=44,
+        )
+        parlay_2 = generate_parlay_candidates(filtered_df, 2, same_game_penalty=0.08, same_team_penalty=0.04)
+        parlay_3 = generate_parlay_candidates(filtered_df.head(18), 3, same_game_penalty=0.10, same_team_penalty=0.05)
+        selected = select_top_parlays_with_fallback(parlay_2 + parlay_3)
+        progress_bar.empty()
+        status_text.empty()
+        render_selected_parlays(selected)
+
+    st.markdown("---")
+    st.subheader("Manual Parlay Builder")
+    st.caption("Choose MLB hitters and evaluate hits/home run targets. This uses MLB Stats game logs when available and falls back to sportsbook-calibrated probability.")
+
+    mlb_player_names = get_mlb_prop_player_names()
+    if not mlb_player_names:
+        st.warning("No MLB player list is available yet. Load today's MLB odds first or check your API/cache source.")
+    else:
+        mlb_num_players = st.number_input("Number of MLB Players", min_value=1, max_value=5, value=2, step=1, key="mlb_num_players")
+        mlb_inputs = []
+        for i in range(mlb_num_players):
+            st.markdown(f"### MLB Player {i+1}")
+            c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1.4])
+            with c1:
+                player_name = st.selectbox(f"Select MLB Player {i+1}", mlb_player_names, key=f"mlb_player_{i}")
+            with c2:
+                target_hits = st.number_input("Hits Target", min_value=0, max_value=5, value=1, key=f"mlb_target_hits_{i}")
+            with c3:
+                target_hr = st.number_input("HR Target", min_value=0, max_value=3, value=1, key=f"mlb_target_hr_{i}")
+            with c4:
+                leg_type = st.selectbox("Count In Parlay", ["Hits only", "Home Runs only", "Both"], key=f"mlb_leg_type_{i}")
+            mlb_inputs.append({"name": player_name, "target_hits": int(target_hits), "target_hr": int(target_hr), "leg_type": leg_type})
+
+        if st.button("Calculate MLB Parlay", key="mlb_calc"):
+            total_prob = 1.0
+            total_ev = 0.0
+            board = build_ranked_best_leg_board(
+                MLB_SPORT_KEY,
+                [("HITS", MLB_HITS_MARKET_KEYS), ("HR", MLB_HR_MARKET_KEYS)],
+                "MLB",
+                top_n=80,
+                enrich_rows=50,
+            )
+
+            for pick in mlb_inputs:
+                player_rows = board[board["player"].apply(lambda x: player_name_matches(pick["name"], x))] if not board.empty and "player" in board.columns else pd.DataFrame()
+                pid = get_mlb_player_id(pick["name"])
+                games_df = fetch_mlb_recent_games(pid) if pid else pd.DataFrame()
+
+                st.markdown("---")
+                st.subheader(f"{pick['name']} · MLB")
+
+                def calc_manual_mlb_leg(market_label: str, target: int):
+                    matching = player_rows[player_rows["market"] == market_label] if not player_rows.empty and "market" in player_rows.columns else pd.DataFrame()
+                    # Prefer a sportsbook line closest to user's target.
+                    row = None
+                    if not matching.empty:
+                        matching = matching.copy()
+                        matching["target_diff"] = matching["line"].apply(lambda x: abs((sportsbook_line_to_target(x) or 0) - target))
+                        row = matching.sort_values(["target_diff", "leg_score"], ascending=[True, False]).iloc[0].to_dict()
+                    line = row.get("line") if row else max(float(target) - 0.5, 0.5)
+                    odds = row.get("book_over_odds") if row else None
+                    if not games_df.empty:
+                        prob, exp, factors = build_mlb_model_v2_projection(games_df, market_label, "", target, line=line, odds=odds)
+                    else:
+                        implied = american_to_implied_prob(odds) if odds is not None else None
+                        prob = round((implied or 0.50) * 100, 2)
+                        exp = estimate_expected_from_probability(line, prob) if line is not None else target
+                        factors = {"model_prob": prob, "projected_stat": exp, "sportsbook_line": line, "target_needed": target, "data_note": "Manual MLB fallback: game logs unavailable.", "line_source": "Sportsbook/manual fallback"}
+                    ev = calculate_ev(prob, american_to_decimal(odds)) if odds is not None else None
+                    fair = probability_to_fair_american(prob)
+                    return line, odds, prob, exp, ev, fair, factors
+
+                hit_line, hit_odds, hit_prob, hit_exp, hit_ev, hit_fair, hit_factors = calc_manual_mlb_leg("HITS", pick["target_hits"])
+                hr_line, hr_odds, hr_prob, hr_exp, hr_ev, hr_fair, hr_factors = calc_manual_mlb_leg("HR", pick["target_hr"])
+
+                if pick["leg_type"] == "Hits only":
+                    total_prob *= hit_prob / 100
+                    total_ev += hit_ev or 0
+                elif pick["leg_type"] == "Home Runs only":
+                    total_prob *= hr_prob / 100
+                    total_ev += hr_ev or 0
+                else:
+                    total_prob *= (hit_prob / 100) * (hr_prob / 100)
+                    total_ev += (hit_ev or 0) + (hr_ev or 0)
+
+                r1 = st.columns(4)
+                r1[0].markdown(metric_card("Hits line", safe_line_display(hit_line), subtext="Sportsbook" if hit_odds is not None else "Model estimate"), unsafe_allow_html=True)
+                r1[1].markdown(metric_card("Hits target", str(pick["target_hits"]), subtext=f"Fair odds: {safe_odds_display(hit_fair)}"), unsafe_allow_html=True)
+                r1[2].markdown(metric_card("Hits hit probability", f"{hit_prob}%"), unsafe_allow_html=True)
+                r1[3].markdown(metric_card("Hits EV", str(hit_ev) if hit_ev is not None else "Model only", "good" if (hit_ev or 0) > 0 else "neutral", f"Book over: {safe_odds_display(hit_odds)}"), unsafe_allow_html=True)
+
+                r2 = st.columns(4)
+                r2[0].markdown(metric_card("HR line", safe_line_display(hr_line), subtext="Sportsbook" if hr_odds is not None else "Model estimate"), unsafe_allow_html=True)
+                r2[1].markdown(metric_card("HR target", str(pick["target_hr"]), subtext=f"Fair odds: {safe_odds_display(hr_fair)}"), unsafe_allow_html=True)
+                r2[2].markdown(metric_card("HR hit probability", f"{hr_prob}%"), unsafe_allow_html=True)
+                r2[3].markdown(metric_card("HR EV", str(hr_ev) if hr_ev is not None else "Model only", "good" if (hr_ev or 0) > 0 else "neutral", f"Book over: {safe_odds_display(hr_odds)}"), unsafe_allow_html=True)
+
+                with st.expander(f"Why these MLB probabilities? — {pick['name']}", expanded=False):
+                    st.markdown("**Hits model read:** " + compact_factor_text(hit_factors))
+                    st.dataframe(pd.DataFrame(_factor_rows_for_leg({"model_factors": hit_factors, "model_prob": hit_prob, "expected_stat": hit_exp, "line": hit_line, "book_over_odds": hit_odds, "ev": hit_ev})), use_container_width=True, hide_index=True)
+                    st.markdown("**Home run model read:** " + compact_factor_text(hr_factors))
+                    st.dataframe(pd.DataFrame(_factor_rows_for_leg({"model_factors": hr_factors, "model_prob": hr_prob, "expected_stat": hr_exp, "line": hr_line, "book_over_odds": hr_odds, "ev": hr_ev})), use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.subheader("MLB Parlay Summary")
+            c1, c2 = st.columns(2)
+            c1.markdown(metric_card("Parlay probability", f"{round(total_prob * 100, 2)}%"), unsafe_allow_html=True)
+            c2.markdown(metric_card("Total EV", f"{round(total_ev, 3)}", "good" if total_ev > 0 else "bad"), unsafe_allow_html=True)
 
